@@ -24,6 +24,7 @@ working boot image or claim production integrity based on these tests.
 | Target userspace | Ubuntu 24.04, systemd 255 family, Dracut 060 family |
 | Kernel | Explicit version from the source UKI, with the **same source module tree** |
 | Signer | Caller-owned RSA certificate and private key, kept outside the checkout |
+| Guest attestation SDK | `Azure/azure-guest-attestation-sdk`, commit `8774be30f452060c56372d34ccbe34c3d3f3c577`; CLI `azure-guest-attest` |
 | Builder | Exclusive Ubuntu 24.04 x86-64 Linux machine with root, mounts, loops and dm-verity |
 
 The pin is in [inputs.json](inputs.json). No kernel version is guessed from the
@@ -148,9 +149,18 @@ machine hosting unrelated workloads:
 ```bash
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  python3 binutils openssl sbsigntool systemd-ukify qemu-utils \
+  build-essential git python3 binutils openssl sbsigntool systemd-ukify qemu-utils \
   rsync gdisk dosfstools e2fsprogs cryptsetup-bin util-linux udev kmod
 ```
+
+The builder also needs an approved Rust toolchain (SDK minimum Rust 1.90;
+local/CI validation uses 1.95.0). The build fetches the exact SDK revision and
+compiles `azure-guest-attest` using its committed lockfile and default
+RustCrypto/rustls backend. It installs the binary, MIT license, provenance and
+the `cvm-attest` wrapper into the root **before hashing**, and checks that both
+commands run inside the target chroot. Compiler/binary/revision evidence is
+retained in `evidence/attestation-sdk.json`. No attestation request is made
+during the offline build; no compiler or SDK source tree is baked into the guest.
 
 The build chroots into a **new copy** of the source and installs `dracut-core`,
 `systemd-boot-efi` and `cryptsetup-bin` there. It disables package service startup
@@ -259,6 +269,85 @@ Guest checks cannot establish Azure CVM security type by themselves.
 Deallocate or remove only your own test VM and temporary upload/source
 resources after acceptance. There is no automatic resource cleanup controller.
 
+## 5. Run PCR-11 guest attestation over SSH
+
+After deploying and completing root-policy acceptance, SSH into the CVM and
+run the installed `cvm-attest` command. No attestation service runs automatically,
+and no SDK download or compilation is required in the running guest.
+
+```bash
+# On the relying party: generate and retain a fresh challenge for this request.
+openssl rand -hex 32
+
+# Over SSH in the CVM, paste that challenge (not a guest-generated freshness proof):
+sudo cvm-attest \
+  --endpoint 'https://<your-approved-provider>.attest.azure.net' \
+  --nonce '<64-lowercase-hex-characters-from-the-relying-party>' \
+  --output /run/cvm-attestation-example
+```
+
+The wrapper always invokes the pinned SDK's **guest** attestation flow with
+`--provider maa --pcr-index 0,2,4,7,11 --user-data hex:<nonce> --json --show-request`.
+PCR 4 covers firmware image measurements, PCR 7 covers Secure Boot policy,
+and **PCR 11 covers systemd-stub's UKI section measurements**, including the
+embedded `.cmdline` with `roothash=` and the data/hash partition identifiers.
+PCR 11 is a digest of an ordered measurement sequence, **not the dm-verity
+root hash itself**. Other UKI sections and subsequent systemd boot-phase
+extensions also affect its value.
+
+The SDK uses SHA-256 PCR reads and an AK-signed TPM quote for the explicit set;
+its `TpmInfo` request carries `PcrQuote`, `PcrSignature`, `PcrSet`, `PCRs`,
+`AikCert` and `AikPub`. The wrapper rejects absent/zero PCR 11, missing quote,
+signature, key, certificate, TEE evidence or event log, an unexpected PCR set,
+Trusted Launch, loopback, or a changed/default endpoint. A nonempty user-data
+challenge also makes this pinned SDK fail rather than silently fall back from
+CVM to Trusted Launch when TEE evidence collection fails.
+
+Evidence is private and volatile under the new `/run` directory:
+
+- `sdk-response.json`, `request.json`, `token.txt`, `sdk-stderr.log`;
+- `receipt.json` with requested PCRs, **reported** PCR 11, challenge and SDK
+  provenance; it explicitly says `NOT_VERIFIED`.
+
+Retrieve the evidence outside the guest before reboot. Protect tokens and raw
+VM-identifying evidence; do not commit them. Failed collection retains
+diagnostics but emits no success receipt. The request/receipt's local command
+line, metadata and PCR values are **not authenticated merely by collecting
+them or receiving a token**.
+
+### What MAA does and what the verifier must check
+
+[Microsoft's guest-attestation documentation](https://learn.microsoft.com/en-us/azure/confidential-computing/guest-attestation-confidential-vms#json-web-token)
+shows `11` in the signed token's `x-ms-azurevm-attested-pcrs` list. This is evidence
+that MAA can attest PCR-11 coverage, **not a documented raw PCR-11 digest claim**.
+That example is for Windows; acceptance of this Linux/systemd UKI evidence and
+the exact returned claim set still require a real test against your endpoint.
+Do not assume arbitrary custom claim emission or a particular provider policy.
+
+An independent relying party must:
+
+1. Validate the MAA token signature against the approved issuer's keys,
+   allowed algorithms, issuer, lifetime and applicable audience/policy.
+2. Require authenticated CVM/TEE and Secure Boot claims and PCR-11 coverage.
+   A decoded SDK `claims` object and its `passed` boolean are not verification.
+3. Authenticate the TPM quote's AK and its binding to the attested CVM, validate
+   the quote signature, actual SHA-256 PCR selection and quoted aggregate
+   digest against the supplied PCR values; replay authenticated measurements
+   against independently retained expected UKI/boot-phase measurements.
+4. Check freshness and the challenge's authenticated binding. `--user-data`
+   binds the challenge into the **TEE runtime claims**, not the TPM quote's
+   `extraData`; this wrapper does not establish fresh challenge-bound TPM quotes.
+   Do not accept an independently replayable old quote solely because a fresh
+   TEE report or token was obtained.
+5. Require the independently expected UKI whose signed command line contains
+   the intended root hash and identifiers. Guest-supplied `roothash=` text or
+   an unsigned claimed PCR value cannot establish image identity.
+
+This change integrates **evidence collection and MAA-flow testing**, not a
+production remote verifier or an automatic claim that the expected root
+filesystem was attested. An endpoint rejecting custom Secure Boot keys or UKI
+event logs is a qualification failure, not a reason to remove PCR 11.
+
 ## Threat model and limits
 
 Secure Boot authenticates the UKI and its embedded root hash, identifiers,
@@ -278,6 +367,7 @@ mandatory before claiming a working CVM reference.
 
 ```bash
 python3 tests/test_recipe.py
+python3 tests/test_attestation.py
 # On a disposable Ubuntu 24.04 test machine:
 sudo apt-get install -y --no-install-recommends \
   dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool
@@ -290,3 +380,7 @@ and rejects a changed expected command line. It also formats/verifies actual
 verity files and rejects corruption. It does not boot a synthetic or real CVM.
 Missing tools are test failures, not skipped checks. CI runs this configuration
 separately on Ubuntu 24.04 without Azure resource creation.
+The attestation wrapper tests use an SDK response double to check exact
+PCR/challenge arguments, retained evidence and failure handling. A separate CI
+job builds the actual pinned SDK and checks its CLI contract without TPM or MAA
+access. Neither test proves actual Azure quote or MAA-token verification.

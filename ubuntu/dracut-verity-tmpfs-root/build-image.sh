@@ -8,7 +8,7 @@ if (($# != 5)); then
 fi
 recipe=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 for tool in python3 losetup lsblk udevadm mount umount rsync sgdisk mkfs.ext4 mkfs.vfat \
-    veritysetup e2fsck chroot openssl sbverify sbsign qemu-img modprobe modinfo findmnt; do
+    veritysetup e2fsck chroot openssl sbverify sbsign qemu-img modprobe modinfo findmnt git cargo rustc cc; do
     command -v "$tool" >/dev/null || fail "Missing required tool: $tool"
 done
 ukify=${UKIFY:-/usr/lib/systemd/ukify}
@@ -37,6 +37,7 @@ openssl x509 -in "$cert" -noout -text | grep -Fq 'Public Key Algorithm: rsaEncry
     fail 'Use an RSA signing certificate for the Azure UEFI db profile'
 install -d -m 700 "$run" "$run/evidence" "$run/source-root" "$run/source-boot" "$run/source-esp" "$run/root" "$run/esp"
 exec > >(tee "$run/build.log") 2>&1
+bash "$recipe/scripts/build-attestation.sh" "$run/attestation-sdk"
 src_loop=''
 out_loop=''
 mounts=()
@@ -123,6 +124,13 @@ if ((${#boots[@]} == 1)); then
     rsync -aHAX --numeric-ids "$run/source-boot/" "$run/root/boot/"
 fi
 python3 "$recipe/scripts/image_policy.py" finalize "$run/root" "$image_urn"
+install -D -m 755 "$run/attestation-sdk/azure-guest-attest" "$run/root/usr/local/bin/azure-guest-attest"
+install -m 755 "$recipe/attest-guest.py" "$run/root/usr/local/bin/cvm-attest"
+install -m 644 "$run/attestation-sdk/build.json" "$run/root/etc/cvm-verity/attestation-sdk.json"
+install -D -m 644 "$run/attestation-sdk/LICENSE" "$run/root/usr/share/doc/azure-guest-attest/LICENSE"
+cp "$run/attestation-sdk/build.json" "$run/evidence/attestation-sdk.json"
+chroot "$run/root" /usr/local/bin/azure-guest-attest --version
+chroot "$run/root" /usr/local/bin/cvm-attest --help
 # Chroot package operations never receive the signing key or the ESP.
 install -D -m 755 "$recipe/scripts/check-root.sh" "$run/root/usr/local/libexec/cvm-check-root"
 install -d "$run/root/usr/lib/dracut/modules.d/91cvm-verity"

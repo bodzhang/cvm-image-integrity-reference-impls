@@ -31,10 +31,21 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool
-      - name: Test offline policy and fail-closed root guard
-        run: python3 ubuntu/dracut-verity-tmpfs-root/tests/test_recipe.py
+      - name: Test offline policy, fail-closed root guard and PCR-11 attestation wrapper
+        run: |
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_recipe.py
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_attestation.py
       - name: Test real Dracut, dm-verity userspace and signed UKI packaging
         run: sudo python3 ubuntu/dracut-verity-tmpfs-root/tests/test_components.py
+  ubuntu-attestation-sdk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Build the pinned SDK and check explicit PCR-selection CLI support
+        run: |
+          bash ubuntu/dracut-verity-tmpfs-root/scripts/build-attestation.sh \
+            "$RUNNER_TEMP/ubuntu-attestation-sdk"
   producer:
     runs-on: ubuntu-22.04
     steps:
