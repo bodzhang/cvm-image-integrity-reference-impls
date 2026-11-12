@@ -81,6 +81,12 @@ unit blocks `initrd-switch-root.service` unless the effective root is a writable
 overlay with upper/work on the same tmpfs, an ext4 read-only lower is mounted
 from the healthy verity mapper, and no swap is active. Corruption must not be
 ignored. A second guard checks the effective root during normal system startup.
+The Dracut module overrides `systemd-volatile-root.service` with a fail-closed
+setup helper: it moves the read-only verity lower to `/run/cvm-overlay/lower`,
+retains a tmpfs at `/run/cvm-overlay`, and mounts the overlay using visible
+upper/work directories there. This avoids native systemd's covered root mount
+and detached tmpfs backing, so both initramfs and runtime guards can verify the
+actual backing filesystems rather than trusting setup metadata.
 There is no GRUB, shim, unsigned command-line add-on, Canonical manifest or
 stock-initramfs fallback on the new ESP. Firmware must support the standard
 Gen2 removable-media path; this still needs Azure acceptance.
@@ -166,6 +172,11 @@ The build chroots into a **new copy** of the source and installs `dracut-core`,
 `systemd-boot-efi` and `cryptsetup-bin` there. It disables package service startup
 and uses private `/run` plus slave `/dev` and `/sys` bind mounts. It neither
 installs the target kernel on the host nor imports host kernel modules.
+Run it in a private mount namespace, as below; shared or slave build-directory
+mount propagation is rejected to prevent mounts leaking into host services.
+During package installation, a temporary mode-0644 resolver permits DNS access
+for APT's unprivileged sandbox; the original resolver file or symlink is restored
+before hashing. Package-index download failures abort the build.
 Package repositories need outbound access; the resulting complete package
 inventory is evidence. Repository versions are not snapshot-pinned, so byte
 reproducibility and arbitrary future package versions are not claimed.
@@ -186,7 +197,7 @@ openssl req -new -x509 -newkey rsa:3072 -sha256 -nodes \
 chmod 600 /secure/signer/db.key
 
 cd ubuntu/dracut-verity-tmpfs-root
-sudo bash build-image.sh /secure/input/source.raw \
+sudo unshare --mount --propagation private bash build-image.sh /secure/input/source.raw \
   /secure/signer/db.key /secure/signer/db.pem \
   /secure/runs/dracut-example '<exact-source-kernel-version>'
 ```
@@ -230,17 +241,27 @@ Required publication and deployment gates:
 3. Require completed replication and exact signer/template readback with
    `$expand=ReplicationStatus,UefiSettings`. An accepted PUT or a certificate
    merely stored in the image is not enrollment.
-4. Deploy one supported DCas_v6 **ConfidentialVM**, with Secure Boot and vTPM
-   enabled and `VMGuestStateOnly`. Do not use Trusted Launch or disable Secure
+4. Deploy one supported **ConfidentialVM** (the acceptance target is
+   `Standard_DC4es_v6`, Intel TDX), with Secure Boot and vTPM
+   enabled and `NonPersistedTPM`. Do not use Trusted Launch or disable Secure
    Boot to make a failed UKI boot. Pass your own SSH public key.
 5. Retain Azure `az vm show` evidence of the actual Gallery version and
    `securityProfile`. Confirm capacity/quota before allocating.
 
 Removing the Canonical initramfs also removes its disk-unlock/provisioning
-integration. This reference uses an unencrypted verified OS disk and relies on
-`VMGuestStateOnly` for guest state. It does **not** support
+integration. This reference uses an unencrypted verified OS disk and
+`NonPersistedTPM` for non-persisted firmware/TPM state; this is not an ephemeral
+OS disk. `VMGuestStateOnly` still persists encrypted guest state and must not
+be treated as stateless VMGS. This reference does **not** support
 `DiskWithVMGuestState`, Canonical's FDE key-unlock flow, or claim compatibility
 with every CVM family. Preserve appropriate image licensing and export policy.
+Stateless custom-key boot is currently blocked: both initial and corrected-image
+`NonPersistedTPM` attempts reported Azure Compute Secure Boot errors despite
+matching Gallery signer readback. An explicit stateless Gallery image profile
+also encountered incompatible definition/UEFI API requirements in the tested
+configuration. See [observed validation limits](VALIDATION.md); do not disable
+Secure Boot or claim that Gallery readback proves the guest firmware trusts the
+key.
 
 ## 4. Accept the deployed CVM, including a real reboot
 

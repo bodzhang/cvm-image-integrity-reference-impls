@@ -58,6 +58,7 @@ class ComponentTests(unittest.TestCase):
             module = base / "modules.d/91cvm-verity"
             shutil.copytree(RECIPE / "dracut/91cvm-verity", module)
             shutil.copy(RECIPE / "scripts/check-root.sh", module / "check-root.sh")
+            shutil.copy(RECIPE / "scripts/mount-volatile-root.sh", module / "mount-volatile-root.sh")
             initrd = root / "initrd"
             (root / "empty").mkdir()
             env = dict(os.environ, dracutbasedir=str(base))
@@ -69,7 +70,8 @@ class ComponentTests(unittest.TestCase):
             inventory = run("lsinitrd", str(initrd))
             for name in ("systemd-veritysetup-generator", "systemd-veritysetup",
                          "systemd-volatile-root", "cvm-check-root", "cvm-verity-root.service",
-                         "initrd-switch-root.service.d/cvm-verity.conf"):
+                         "cvm-mount-volatile-root", "initrd-switch-root.service.d/cvm-verity.conf",
+                         "systemd-volatile-root.service.d/cvm-verity.conf"):
                 self.assertIn(name, inventory)
             self.assertNotIn("snap-bootstrap", inventory)
             key, cert = root / "key.pem", root / "cert.pem"

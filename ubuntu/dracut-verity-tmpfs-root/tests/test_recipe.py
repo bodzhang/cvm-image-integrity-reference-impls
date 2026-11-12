@@ -94,6 +94,66 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("latest", INPUTS["imageUrn"])
 
 
+class ChrootResolverTests(unittest.TestCase):
+    def test_build_mounts_require_private_propagation(self):
+        script = (RECIPE / "build-image.sh").read_text()
+        start = script.index("propagation=$(findmnt")
+        guard = script[start:script.index("exec > ", start)]
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            (tools / "findmnt").write_text(
+                '#!/bin/bash\nprintf "%s\\n" "$TEST_PROPAGATION"\nexit "${TEST_FINDMNT_EXIT:-0}"\n')
+            (tools / "findmnt").chmod(0o755)
+            for propagation, status in (("private", "0"), ("shared", "0"),
+                                        ("slave", "0"), ("", "0"), ("private", "1")):
+                with self.subTest(propagation=propagation, status=status):
+                    env = dict(os.environ, PATH=str(tools) + ":" + os.environ["PATH"],
+                               TEST_PROPAGATION=propagation, TEST_FINDMNT_EXIT=status)
+                    result = subprocess.run(
+                        ["bash", "-eu", "-c", 'run=$1\nfail() { echo "$*" >&2; exit 1; }\n' + guard,
+                         "test", directory], env=env, text=True, capture_output=True)
+                    self.assertEqual(result.returncode == 0, propagation == "private" and status == "0")
+
+    def test_readable_temporary_resolver_and_exact_original_restoration(self):
+        script = (RECIPE / "build-image.sh").read_text()
+        start = script.index('resolver="$run/root/etc/resolv.conf"')
+        prepare = script[start:script.index('if test -e "$run/root/usr/sbin/policy-rc.d"', start)]
+        start = script.index('rm "$resolver"')
+        restore = script[start:script.index('chroot "$run/root" apt-get clean', start)]
+        for original in ("file", "dangling-symlink", "absent"):
+            with self.subTest(original=original), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "root"
+                (root / "etc").mkdir(parents=True)
+                (root / "run").mkdir()
+                resolver = root / "etc/resolv.conf"
+                target = "../run/systemd/resolve/stub-resolv.conf"
+                contents = "nameserver 192.0.2.53\n"
+                if original == "file":
+                    resolver.write_text(contents)
+                    resolver.chmod(0o640)
+                elif original == "dangling-symlink":
+                    resolver.symlink_to(target)
+                prefix = 'umask 077\nrun=$1\n'
+                subprocess.run(["bash", "-eu", "-c", prefix + prepare, "test", directory], check=True)
+                self.assertFalse(resolver.is_symlink())
+                self.assertEqual(resolver.stat().st_mode & 0o777, 0o644)
+                self.assertEqual(resolver.read_bytes(), Path("/etc/resolv.conf").read_bytes())
+                subprocess.run(["bash", "-eu", "-c",
+                                prefix + 'resolver="$run/root/etc/resolv.conf"\n' + restore,
+                                "test", directory], check=True)
+                self.assertFalse((root / "run/original-resolv.conf").is_symlink())
+                self.assertFalse((root / "run/original-resolv.conf").exists())
+                if original == "file":
+                    self.assertEqual(resolver.read_text(), contents)
+                    self.assertEqual(resolver.stat().st_mode & 0o777, 0o640)
+                elif original == "dangling-symlink":
+                    self.assertTrue(resolver.is_symlink())
+                    self.assertEqual(os.readlink(resolver), target)
+                else:
+                    self.assertFalse(resolver.exists())
+                    self.assertFalse(resolver.is_symlink())
+
+
 class RootGuardTests(unittest.TestCase):
     def run_guard(self, change=None):
         with tempfile.TemporaryDirectory() as directory:
@@ -135,8 +195,10 @@ esac
 
     def test_rejects_unsafe_or_corrupt_root(self):
         for change in (
-            {"ROOT_FS": "ext4"}, {"ROOT_OPTIONS": "ro,upperdir=/upper/u,workdir=/upper/w"},
-            {"ROOT_OPTIONS": "rw"}, {"UPPER_FS": "ext4"}, {"LOWER_OPTIONS": "rw"},
+            {"ROOT_FS": "ext4"}, {"ROOT_FS": "ext4\noverlay"},
+            {"ROOT_OPTIONS": "ro,upperdir=/upper/u,workdir=/upper/w"},
+            {"ROOT_OPTIONS": "rw"}, {"UPPER_FS": "ext4"}, {"UPPER_FS": "rootfs"},
+            {"LOWER_OPTIONS": "rw"},
             {"DM_TYPE": "linear"}, {"DM_STATUS": "C"}, {"SWAP_DEVICE": "/dev/sdb1\n"},
             {"SWAP_ERROR": "1"}, {"TARGET_ERROR": "1"}, {"WORK_TARGET": "/different-tmpfs"},
         ):
@@ -150,6 +212,14 @@ esac
         contents = (RECIPE / "dracut/91cvm-verity/switch-root.conf").read_text()
         self.assertIn("Requires=cvm-verity-root.service", contents)
         self.assertIn("After=cvm-verity-root.service", contents)
+
+    def test_volatile_setup_overrides_native_detached_backing_mounts(self):
+        contents = (RECIPE / "dracut/91cvm-verity/volatile-root.conf").read_text()
+        self.assertIn("ExecStart=\nExecStart=/usr/local/libexec/cvm-mount-volatile-root /sysroot", contents)
+        self.assertIn("StandardError=journal+console", contents)
+        module = (RECIPE / "dracut/91cvm-verity/module-setup.sh").read_text()
+        self.assertIn("systemd-volatile-root.service.d/cvm-verity.conf", module)
+        self.assertIn("inst_script \"$moddir/mount-volatile-root.sh\"", module)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,9 @@ test "$key_pub" = "$cert_pub" || fail 'Key and certificate do not match'
 openssl x509 -in "$cert" -noout -text | grep -Fq 'Public Key Algorithm: rsaEncryption' ||
     fail 'Use an RSA signing certificate for the Azure UEFI db profile'
 install -d -m 700 "$run" "$run/evidence" "$run/source-root" "$run/source-boot" "$run/source-esp" "$run/root" "$run/esp"
+propagation=$(findmnt -rn -o PROPAGATION -T "$run")
+test "$propagation" = private ||
+    fail 'Use unshare --mount --propagation private to isolate build mounts'
 exec > >(tee "$run/build.log") 2>&1
 bash "$recipe/scripts/build-attestation.sh" "$run/attestation-sdk"
 src_loop=''
@@ -136,17 +139,20 @@ install -D -m 755 "$recipe/scripts/check-root.sh" "$run/root/usr/local/libexec/c
 install -d "$run/root/usr/lib/dracut/modules.d/91cvm-verity"
 cp "$recipe/dracut/91cvm-verity/"* "$run/root/usr/lib/dracut/modules.d/91cvm-verity/"
 install -m 755 "$recipe/scripts/check-root.sh" "$run/root/usr/lib/dracut/modules.d/91cvm-verity/check-root.sh"
+install -m 755 "$recipe/scripts/mount-volatile-root.sh" "$run/root/usr/lib/dracut/modules.d/91cvm-verity/mount-volatile-root.sh"
 mount_tracked -t proc proc "$run/root/proc"
 mount_tracked --rbind /dev "$run/root/dev"
 mount --make-rslave "$run/root/dev"
 mount_tracked --rbind /sys "$run/root/sys"
 mount --make-rslave "$run/root/sys"
-# Bind a file, not a symlink to an unavailable systemd-resolved runtime path.
-resolver="$run/root/etc/resolv.conf"
-if test -L "$resolver"; then rm "$resolver"; fi
-cp -L /etc/resolv.conf "$resolver"
 install -d "$run/root/run"
 mount_tracked -t tmpfs tmpfs "$run/root/run"
+# APT drops privileges; its temporary resolver must remain world-readable.
+resolver="$run/root/etc/resolv.conf"
+if test -e "$resolver" || test -L "$resolver"; then
+    mv "$resolver" "$run/root/run/original-resolv.conf"
+fi
+install -m 644 /etc/resolv.conf "$resolver"
 if test -e "$run/root/usr/sbin/policy-rc.d" || test -L "$run/root/usr/sbin/policy-rc.d"; then
     mv "$run/root/usr/sbin/policy-rc.d" "$run/root/run/original-policy-rc.d"
 fi
@@ -155,7 +161,7 @@ cat > "$run/root/usr/sbin/policy-rc.d" <<'POLICY'
 exit 101
 POLICY
 chmod 755 "$run/root/usr/sbin/policy-rc.d"
-chroot "$run/root" apt-get update
+chroot "$run/root" apt-get -o APT::Update::Error-Mode=any update
 chroot "$run/root" apt-get install -y --no-install-recommends dracut-core systemd-boot-efi cryptsetup-bin
 install -d "$run/root/etc/cvm-verity/dracut-empty"
 chroot "$run/root" dpkg-query -W > "$run/evidence/packages.txt"
@@ -176,7 +182,8 @@ chroot "$run/root" dracut --force --no-hostonly --no-hostonly-cmdline \
     --gzip /run/cvm.initrd "$kernel"
 chroot "$run/root" lsinitrd /run/cvm.initrd > "$run/evidence/initrd-inventory.txt"
 for required in systemd-veritysetup-generator systemd-veritysetup systemd-volatile-root \
-    cvm-check-root cvm-verity-root.service initrd-switch-root.service.d/cvm-verity.conf; do
+    cvm-check-root cvm-mount-volatile-root cvm-verity-root.service \
+    initrd-switch-root.service.d/cvm-verity.conf systemd-volatile-root.service.d/cvm-verity.conf; do
     grep -Fq "$required" "$run/evidence/initrd-inventory.txt" || fail "Missing initramfs component: $required"
 done
 if grep -Eq 'snap-bootstrap|snap-initramfs-mounts' "$run/evidence/initrd-inventory.txt"; then
@@ -188,6 +195,10 @@ cp -L "$run/root/etc/os-release" "$run/os-release"
 rm "$run/root/usr/sbin/policy-rc.d"
 if test -e "$run/root/run/original-policy-rc.d" || test -L "$run/root/run/original-policy-rc.d"; then
     mv "$run/root/run/original-policy-rc.d" "$run/root/usr/sbin/policy-rc.d"
+fi
+rm "$resolver"
+if test -e "$run/root/run/original-resolv.conf" || test -L "$run/root/run/original-resolv.conf"; then
+    mv "$run/root/run/original-resolv.conf" "$resolver"
 fi
 chroot "$run/root" apt-get clean
 truncate -s 0 "$run/root/etc/machine-id"
