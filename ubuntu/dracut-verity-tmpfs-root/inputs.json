@@ -1,0 +1,11 @@
+{
+  "imageUrn": "Canonical:ubuntu-24_04-lts:cvm:24.04.202610280",
+  "catalogLocation": "westus3",
+  "catalogChecked": "2026-11-12",
+  "architecture": "x64",
+  "hyperVGeneration": "V2",
+  "ubuntuVersion": "24.04",
+  "espMiB": 512,
+  "dataMiB": 32768,
+  "blockSize": 4096
+}

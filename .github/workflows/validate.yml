@@ -22,6 +22,19 @@ jobs:
       - name: Validate scripts, configuration, and certificate profile
         shell: pwsh
         run: .\ubuntu\verity-tmpfs-root\tests\Test-Local.ps1
+  ubuntu-dracut:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install userspace component test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool
+      - name: Test offline policy and fail-closed root guard
+        run: python3 ubuntu/dracut-verity-tmpfs-root/tests/test_recipe.py
+      - name: Test real Dracut, dm-verity userspace and signed UKI packaging
+        run: sudo python3 ubuntu/dracut-verity-tmpfs-root/tests/test_components.py
   producer:
     runs-on: ubuntu-22.04
     steps:
