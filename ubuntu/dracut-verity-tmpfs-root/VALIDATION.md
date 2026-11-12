@@ -7,16 +7,17 @@
 | Surface | Scope |
 | --- | --- |
 | Marketplace catalog | Read-only Azure queries on 2026-11-12 returned the pinned non-Pro Ubuntu 24.04 CVM version in westus3, x64/Gen2 and `TrustedLaunchAndConfidentialVmSupported` |
-| Offline policy tests | 14 tests passed: generalized-source guards, writable-state finalization, pinned input, exact generated boot inputs, private mount-propagation enforcement, temporary resolver permissions/exact restoration, required switch-root dependency, volatile-service override and root-policy success/rejection paths |
+| Offline policy tests | 15 tests passed: generalized-source guards, writable-state finalization, pinned input, exact generated boot inputs, private mount-propagation enforcement, temporary resolver permissions/exact restoration, required switch-root dependency, volatile-service override, shared-parent setup and root-policy success/rejection paths |
+| Guest-verifier tests | 3 tests passed: completed clean cloud-init, explicit recoverable-warning reporting, and fatal/incomplete/malformed-status rejection |
 | Real userspace tests | SHA-256 verity format/verification and corrupted-data/wrong-hash rejection; kernel-less Dracut/systemd initramfs and RSA-signed systemd-stub UKI, exact section checks and changed-command-line rejection |
 | Pinned attestation SDK | Actual release CLI built from `8774be30f452060c56372d34ccbe34c3d3f3c577` with committed lockfile; PCR-selection/JSON CLI contract checked; wrapper tests request `0,2,4,7,11` and hardware-bound user data, reject incomplete evidence/fallback and do not claim remote verification |
 | Complete Marketplace conversion | **Passed on 2026-11-12** using an unbooted disk from the exact Marketplace pin on a dedicated Ubuntu 24.04 Azure builder; complete build marker includes fixed-VHD validation |
-| Kernel/driver compatibility | Matching signed-module gates passed for original kernel `7.0.0-1016-azure-fde`; source configuration includes `CONFIG_INTEL_TDX_GUEST=y`; actual CVM runtime compatibility remains unestablished |
+| Kernel/driver compatibility | Matching signed-module gates passed for original kernel `7.0.0-1016-azure-fde`; source configuration includes `CONFIG_INTEL_TDX_GUEST=y`; this kernel booted the tested Intel TDX `Standard_DC4es_v6` CVM |
 | Real live dm-verity corruption | **Passed in the complete image build**: disposable corrupted data rejected both offline verification and live mapper reads, with mapper status `C` |
-| Visible volatile-overlay backing | **Passed on the Azure builder** using the original image's read-only verity mapper: moved ext4 lower, retained tmpfs upper/work and both setup/runtime guard invocations passed |
-| Azure signer enrollment / CVM boot | Gallery publication, completed replication and exact custom signer/Microsoft template readback passed. `VMGuestStateOnly` reached the original kernel with Secure Boot enabled, verity and native overlay but failed the root guard. Both initial and corrected-image `NonPersistedTPM` attempts reported Compute `SecureBootClientError`; guest firmware db verification remains unperformed |
-| First boot / workload / real reboot | Guest acceptance gates supplied; **not run** |
-| Actual PCR-11 quote / MAA flow | SSH-invoked collector installed before hashing; **not run on a CVM**; verified MAA PCR-11 value emission and expected-UKI remote verification are not established |
+| Visible volatile-overlay backing | **Passed on the builder and actual CVM**: bind-mounted read-only lower, retained tmpfs upper/work, required initrd guard and runtime guard passed, including after a real reboot |
+| Azure signer enrollment / CVM boot | Gallery 1.0.3 replication and exact custom signer/Microsoft template readback passed; `VMGuestStateOnly` booted with Secure Boot enabled and the independently expected signer present in actual firmware db. Initial and corrected-image `NonPersistedTPM` attempts reported Compute `SecureBootClientError` |
+| First boot / workload / real reboot | **Passed**: full verity verification and firmware/kernel/hash/device/agent checks on both boots; 136 MiB and 2,051 measured tmpfs inodes; distinct reboot ID and entire workload absent |
+| Actual PCR-11 quote / MAA flow | Installed SDK attempted real MAA attestation and failed on omitted systemd phase events; genuine combined replay matches actual PCR 11. Tmpfs-only supplemented-log/expanded-PCR diagnostic then reached a `dbvalidated=false` policy denial. **No token issued or remote expected-UKI verification established** |
 
 These tests are not simulated evidence of Azure firmware behavior. A UKI with
 a synthetic kernel payload proves packaging/signature/section binding only.
@@ -41,11 +42,11 @@ The initial CVM boot also exposed a native systemd overlay-layout mismatch:
 systemd overmounted the ext4 root at the same target and detached the tmpfs
 backing mount, so the guard could not independently inspect the effective root
 and upper/work filesystems. The custom `systemd-volatile-root.service` setup now
-moves the verified lower and retains the backing tmpfs at visible paths. The
+relocates the verified lower and retains the backing tmpfs at visible paths. The
 real-image builder probe, both actual Dracut/signed-UKI component tests, and a
 new complete Marketplace conversion passed with this change. The corrected
-image passed signed-section, live-corruption and fixed-VHD gates; these are not
-a successful CVM boot.
+image passed signed-section, live-corruption and fixed-VHD gates; version 1.0.1
+alone did not establish a successful CVM boot.
 
 The stateless attempt used the same originally published image. Its Azure
 Compute VM instance-view reported
@@ -59,8 +60,88 @@ root hash matched the uploaded VHD and verified UKI. A distinct VM using this
 version, `NonPersistedTPM`, Secure Boot/vTPM and managed boot diagnostics enabled
 at creation reported the same Secure Boot error within about 20 seconds. Both
 diagnostic blobs were again unavailable. The failed target was verified
-deallocated; stateless boot, guest firmware db, real reboot and MAA qualification
-remain blocked.
+deallocated; stateless boot and its guest/reboot/MAA qualification remain blocked.
+
+The corrected image was subsequently retried with upstream's persisted
+`VMGuestStateOnly` mode. Its serial log proves Secure Boot enabled, the expected
+embedded root hash and successful verity activation. It then exposed a second
+setup issue: PID 1's shared parent mount forbids `mount --move` of `/sysroot`.
+The helper now binds the read-only lower at its retained path, unmounts the
+original lower and installs the overlay without globally changing mount
+propagation. A real-image probe with an explicitly shared parent reproduced
+the old move failure and passed the new helper and both root guards; all 15
+policy tests and both real userspace component tests passed. The subsequent
+complete image 1.0.3 build also passed signed-section, corruption and fixed-VHD
+gates. A transient negative-mapper cleanup warning was followed by an explicit
+check confirming that the owned negative mapper no longer existed. Azure
+first/reboot acceptance subsequently passed for this change, as recorded below.
+
+## Demonstrated persisted-TPM acceptance
+
+Gallery version 1.0.3 booted on an Intel TDX `Standard_DC4es_v6` CVM in westus3,
+using `VMGuestStateOnly`, Secure Boot and vTPM. The OS disk was an ordinary
+64-GiB managed disk: no ephemeral `diffDiskSettings`, confidential OS-disk
+encryption or `DiskWithVMGuestState` was requested.
+
+The independent verifier confirmed the actual firmware signer, exact original
+kernel and embedded command line, live data/hash devices and root hash, healthy
+read-only verity lower, visible tmpfs backing, no swap and usable guest agent.
+It fully verified the data partition on both boots. The first workload consumed
+142,610,432 bytes (136 MiB) and 2,051 inodes. The boot ID changed from
+`7cba07f7-01c5-42b7-b8af-c97a4927989b` to
+`33486c1d-892b-46d9-8cbd-2c4986e1cc5a`, and the entire workload disappeared.
+Independently retained private build and guest JSON records support these
+results; raw VM-identifying evidence and tokens are not published here.
+
+After reboot, cloud-init completed with exit 2 and an Azure provisioning-media
+unavailable / IMDS fallback warning, but no fatal errors. The externally supplied
+verifier now explicitly checks JSON status and fatal-error arrays, reports and
+retains recoverable warnings, and rejects incomplete or failed provisioning.
+The full post-reboot recheck passed without rebuilding the VHD.
+
+## Actual MAA investigation: no successful token
+
+The installed pinned SDK submitted genuine CVM evidence to
+`https://sharedwus3.wus3.attest.azure.net`. Its initial request quoted SHA-256
+PCRs `0,2,4,7,11`; MAA returned HTTP 400 `PcrDoesNotMatchTcg` for PCR 11.
+Evidence collection took approximately 128 ms; this was not a long MAA wait.
+Full guest disk verification and Azure managed-command scheduling are separate
+operations.
+
+The SDK reads only `/sys/kernel/security/tpm0/binary_bios_measurements`.
+Systemd additionally extends the actual `sysinit` and `ready` phase strings into
+PCR 11 and records their digests in `/run/log/systemd/tpm2-measure.log`.
+It does **not** measure journal contents. Read-only TPM PCR reads and replay of
+genuine captured records established:
+
+| SHA-256 PCR 11 source | Value |
+| --- | --- |
+| Firmware log replay only | `edf97efb412cf0d2b128a660dbc686091a5c280c7216ce06f476b2e45e5f7e86` |
+| Firmware plus genuine phase events | `c8f073389ac35102792ea15ca251171d9150920a36977ac886adbfd7f2f0605e` |
+| Actual TPM read / PCR reported in MAA mismatch | `c8f073389ac35102792ea15ca251171d9150920a36977ac886adbfd7f2f0605e` |
+
+A diagnostic in tmpfs appended the genuine recorded phase digests as TCG2
+`EV_IPL` events to unaltered firmware bytes. Every appended digest was checked
+against its actual phase string. A private mount namespace supplied this
+explicitly supplemented input to the unchanged SDK; the protected image, TPM
+and quote generation were unchanged. This is **not** an untouched firmware log.
+
+With PCRs `0,2,4,7,11`, the error advanced to `PcrQuoteHashDoesNotMatch`:
+`Pcr index 1 not present in quote`. A second diagnostic quoted all boot PCRs
+`0,1,2,3,4,5,6,7,11`, retaining PCR 11. MAA then returned
+`PolicyEvaluationError` / `PolicyValidationFailure` with the explicit deny rule:
+
+```text
+[type=="x-ms-azurevm-dbvalidated", value==false] => deny();
+```
+
+This demonstrates a further provider-policy rejection, distinct from firmware
+Secure Boot acceptance and the earlier event-log/quote errors. It does not
+prove successful token issuance, a general custom-key attestation prohibition,
+or an independently authenticated expected-UKI result. No provider policy was
+changed, Secure Boot disabled, PCR 11 omitted or synthetic evidence substituted.
+The installed collector still uses its original firmware-only input and exact
+PCR set; these tmpfs diagnostics are not an integrated SDK fix.
 
 A further publication experiment explicitly set
 `publishingProfile.targetRegions[].encryption.osDiskImage.securityProfile.confidentialVMEncryptionType`
@@ -89,9 +170,9 @@ accept a successful PUT or an old execution result as evidence of a new command.
 2. Publish the actual VHD with its actual public UKI signer in Gallery UEFI db;
    require completed replication and exact signer/template API readback.
 3. Boot a supported ConfidentialVM with Secure Boot, vTPM and
-   `NonPersistedTPM`; record the actual Azure image/security profile. Do not
-   substitute `VMGuestStateOnly`: it persists encrypted VMGS, although neither
-   mode here requests confidential OS-disk encryption.
+   `VMGuestStateOnly`; record the actual Azure image/security profile. This
+   persists encrypted VMGS but does not request confidential OS-disk encryption.
+   Qualify `NonPersistedTPM` separately rather than inheriting these results.
 4. Run the guest verifier using independently retained build inputs. Confirm
    firmware db and live kernel/hash/device identities, healthy read-only verity
    lower, writable tmpfs overlay, no swap, usable agents and cloud-init.

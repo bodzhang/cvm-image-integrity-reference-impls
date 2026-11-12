@@ -30,6 +30,27 @@ def device_number(value):
     return os.major(stat.st_rdev), os.minor(stat.st_rdev)
 
 
+def cloud_init_status():
+    result = subprocess.run(["cloud-init", "status", "--wait", "--format=json"],
+                            text=True, capture_output=True)
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="")
+    require(result.returncode in (0, 2), f"Cloud-init status failed: {result.returncode}")
+    status = json.loads(result.stdout)
+    require(isinstance(status, dict) and status.get("status") == "done",
+            "Cloud-init has not completed")
+    require(status.get("errors") == [], "Cloud-init has fatal errors")
+    for stage in ("init", "init-local", "modules-config", "modules-final"):
+        if stage in status:
+            require(isinstance(status[stage], dict) and status[stage].get("errors") == [],
+                    f"Cloud-init stage {stage} has fatal errors")
+    warnings = status.get("recoverable_errors")
+    require(isinstance(warnings, dict), "Missing cloud-init recoverable-error report")
+    if result.returncode == 2 or warnings:
+        print("CVM_CLOUD_INIT_RECOVERABLE_WARNINGS=" + json.dumps(warnings), file=sys.stderr)
+    return status
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("build_json", type=Path)
@@ -65,7 +86,7 @@ def main():
     subprocess.run(["veritysetup", "verify", data, hashes, expected["rootHash"]], check=True, stdout=sys.stderr)
     require(run("systemctl", "is-active", "walinuxagent.service") == "active", "Azure guest agent is not active")
     require(run("systemctl", "--failed", "--no-legend", "--plain") == "", "Failed systemd units")
-    subprocess.run(["cloud-init", "status", "--wait"], check=True, stdout=sys.stderr)
+    cloud_init = cloud_init_status()
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     if args.previous_boot_id:
         require(boot_id != str(uuid.UUID(args.previous_boot_id)), "No real reboot occurred")
@@ -94,7 +115,8 @@ def main():
         require(inodes >= 2050, "Workload did not allocate the expected tmpfs inodes")
         workload = {"allocatedBytes": allocated, "allocatedInodes": inodes}
     print(json.dumps({"result": "GUEST_ACCEPTANCE_PASSED", "bootId": boot_id,
-                      "rootHash": expected["rootHash"], "workload": workload}, indent=2))
+                      "rootHash": expected["rootHash"], "workload": workload,
+                      "cloudInit": cloud_init}, indent=2))
 
 
 if __name__ == "__main__":

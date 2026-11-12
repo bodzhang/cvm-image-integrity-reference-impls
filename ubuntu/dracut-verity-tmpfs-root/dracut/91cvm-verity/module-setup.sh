@@ -1,14 +1,14 @@
 #!/bin/bash
 # shellcheck disable=SC2154
 check() {
-    require_binaries findmnt dmsetup swapon grep awk sed tr mount mkdir ln || return 1
+    require_binaries findmnt dmsetup swapon grep awk sed tr mount umount mkdir ln || return 1
     return 255
 }
 depends() {
     echo "systemd-initrd systemd-veritysetup dracut-systemd"
 }
 install() {
-    inst_multiple findmnt dmsetup swapon grep awk sed tr mount mkdir ln
+    inst_multiple findmnt dmsetup swapon grep awk sed tr mount umount mkdir ln
     inst_script "$moddir/check-root.sh" /usr/local/libexec/cvm-check-root
     inst_script "$moddir/mount-volatile-root.sh" /usr/local/libexec/cvm-mount-volatile-root
     inst_simple "$moddir/cvm-verity-root.service" "$systemdsystemunitdir/cvm-verity-root.service"

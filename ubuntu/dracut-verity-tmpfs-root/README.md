@@ -9,10 +9,11 @@ generates dm-verity data, and builds a signed UKI embedding `roothash=` and
 explicit data/hash partition identifiers. All writes to the effective root are
 volatile; the verified ext4 lower never has a writable fallback.
 
-**Status: experimental, PR-ready implementation with local component tests.
-Conversion of the pinned Marketplace disk and Azure CVM boot have not been
-demonstrated.** A catalog query is not boot qualification. Do not replace a
-working boot image or claim production integrity based on these tests.
+**Status: experimental. Complete Marketplace conversion, custom-signed UKI
+boot and first-boot/real-reboot acceptance passed on an Azure Intel TDX CVM
+using `VMGuestStateOnly`. Stateless boot and successful MAA token issuance
+remain unqualified.** See [the observed evidence and limits](VALIDATION.md).
+Do not claim production integrity or remote image verification from these tests.
 
 ## Inputs and boundaries
 
@@ -82,14 +83,15 @@ overlay with upper/work on the same tmpfs, an ext4 read-only lower is mounted
 from the healthy verity mapper, and no swap is active. Corruption must not be
 ignored. A second guard checks the effective root during normal system startup.
 The Dracut module overrides `systemd-volatile-root.service` with a fail-closed
-setup helper: it moves the read-only verity lower to `/run/cvm-overlay/lower`,
+setup helper: it bind-mounts the read-only verity lower at `/run/cvm-overlay/lower`
+and unmounts the original lower mount before installing the overlay,
 retains a tmpfs at `/run/cvm-overlay`, and mounts the overlay using visible
 upper/work directories there. This avoids native systemd's covered root mount
 and detached tmpfs backing, so both initramfs and runtime guards can verify the
 actual backing filesystems rather than trusting setup metadata.
 There is no GRUB, shim, unsigned command-line add-on, Canonical manifest or
 stock-initramfs fallback on the new ESP. Firmware must support the standard
-Gen2 removable-media path; this still needs Azure acceptance.
+Gen2 removable-media path; it was accepted in the tested persisted-TPM configuration.
 
 The root fstab disk mounts and disk swap are removed before hashing; the ESP is
 not mounted in the guest. Files from a separate `/boot` are copied inside the
@@ -243,16 +245,18 @@ Required publication and deployment gates:
    merely stored in the image is not enrollment.
 4. Deploy one supported **ConfidentialVM** (the acceptance target is
    `Standard_DC4es_v6`, Intel TDX), with Secure Boot and vTPM
-   enabled and `NonPersistedTPM`. Do not use Trusted Launch or disable Secure
+   enabled and `VMGuestStateOnly`, following the original custom-key enrollment
+   approach. Do not use Trusted Launch or disable Secure
    Boot to make a failed UKI boot. Pass your own SSH public key.
 5. Retain Azure `az vm show` evidence of the actual Gallery version and
    `securityProfile`. Confirm capacity/quota before allocating.
 
 Removing the Canonical initramfs also removes its disk-unlock/provisioning
 integration. This reference uses an unencrypted verified OS disk and
-`NonPersistedTPM` for non-persisted firmware/TPM state; this is not an ephemeral
-OS disk. `VMGuestStateOnly` still persists encrypted guest state and must not
-be treated as stateless VMGS. This reference does **not** support
+`VMGuestStateOnly` for persisted encrypted firmware/TPM guest state, not
+confidential OS-disk encryption. `NonPersistedTPM` is a separate experimental
+non-persisted guest-state mode; neither option here selects an ephemeral OS
+disk. This reference does **not** support
 `DiskWithVMGuestState`, Canonical's FDE key-unlock flow, or claim compatibility
 with every CVM family. Preserve appropriate image licensing and export policy.
 Stateless custom-key boot is currently blocked: both initial and corrected-image
@@ -284,6 +288,8 @@ verity verification, tmpfs/root policy, cloud-init, guest agent and failed
 systemd units. It requires at least 128 MiB of measured tmpfs block allocation
 and 2,050 new inodes from 128 MiB plus 2,048 small files and reboot markers.
 Reboot acceptance requires a distinct boot ID and loss of the entire workload.
+Completed cloud-init status with exit 2 is accepted only with no reported fatal
+errors; recoverable warnings are explicitly reported and retained in the result.
 Keep both JSON results and Azure security-profile evidence outside the VM.
 Guest checks cannot establish Azure CVM security type by themselves.
 
@@ -295,6 +301,14 @@ resources after acceptance. There is no automatic resource cleanup controller.
 After deploying and completing root-policy acceptance, SSH into the CVM and
 run the installed `cvm-attest` command. No attestation service runs automatically,
 and no SDK download or compilation is required in the running guest.
+
+**Observed limitation:** the installed SDK reads only the firmware event log,
+omitting genuine systemd boot-phase extensions into PCR 11. The tested shared
+West US 3 MAA endpoint rejects this with `PcrDoesNotMatchTcg`. A tmpfs-only
+diagnostic appended genuine recorded phase events and quoted PCRs `0-7,11`;
+the error advanced to a policy denial of `x-ms-azurevm-dbvalidated=false`.
+No token was issued. The diagnostic does not change the installed collector
+or qualify its default PCR set. See [the attestation investigation](VALIDATION.md).
 
 ```bash
 # On the relying party: generate and retain a fresh challenge for this request.
@@ -315,6 +329,9 @@ embedded `.cmdline` with `roothash=` and the data/hash partition identifiers.
 PCR 11 is a digest of an ordered measurement sequence, **not the dm-verity
 root hash itself**. Other UKI sections and subsequent systemd boot-phase
 extensions also affect its value.
+Systemd does not measure journal contents into PCR 11: journal notices describe
+phase measurements, whose genuine userspace records are in
+`/run/log/systemd/tpm2-measure.log`.
 
 The SDK uses SHA-256 PCR reads and an AK-signed TPM quote for the explicit set;
 its `TpmInfo` request carries `PcrQuote`, `PcrSignature`, `PcrSet`, `PCRs`,
@@ -389,6 +406,7 @@ mandatory before claiming a working CVM reference.
 ```bash
 python3 tests/test_recipe.py
 python3 tests/test_attestation.py
+python3 tests/test_guest_validation.py
 # On a disposable Ubuntu 24.04 test machine:
 sudo apt-get install -y --no-install-recommends \
   dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool

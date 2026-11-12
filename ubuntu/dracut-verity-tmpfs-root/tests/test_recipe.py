@@ -221,6 +221,14 @@ esac
         self.assertIn("systemd-volatile-root.service.d/cvm-verity.conf", module)
         self.assertIn("inst_script \"$moddir/mount-volatile-root.sh\"", module)
 
+    def test_volatile_setup_supports_shared_parent_mounts(self):
+        helper = (RECIPE / "scripts/mount-volatile-root.sh").read_text()
+        self.assertIn('mount --bind "$root" "$base/lower"', helper)
+        self.assertIn('umount "$root"', helper)
+        self.assertNotIn("mount --move", helper)
+        module = (RECIPE / "dracut/91cvm-verity/module-setup.sh").read_text()
+        self.assertIn("mount umount mkdir ln", module)
+
 
 if __name__ == "__main__":
     unittest.main()
