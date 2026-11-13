@@ -18,6 +18,15 @@ The signed UKI embeds the root hash and both verity partition identifiers.
 The effective root is a writable overlay backed by tmpfs over a read-only
 dm-verity lower; it has no writable disk fallback.
 
+### Related reference
+
+See Azure's [AzureStack-Tools Confidential Computing CVM Image Builder](https://github.com/Azure/AzureStack-Tools/tree/master/ConfidentialComputing/CvmImageBuilder)
+for another Dracut/systemd, UKI and dm-verity implementation. This recipe is not
+a direct port: that builder creates Ubuntu with `debootstrap`, uses SquashFS and
+limits writable state to selected directories; this recipe preserves the pinned
+Marketplace kernel/modules and uses an ext4 verity lower with a whole-root tmpfs
+overlay.
+
 **Experimental:** manual Gallery 1.0.4 publication, Intel TDX first/reboot SSH
 acceptance and installed native-collector MAA testing passed. The shared controller
 built/uploaded a fresh image and completed Gallery replication; recovered managed
