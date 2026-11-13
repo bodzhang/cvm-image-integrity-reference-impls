@@ -409,6 +409,25 @@ class AzureBoundaryTests(Fixture):
         with self.assertRaises(deploy.DeploymentError):
             self.engine.check_reference_model(changed)
 
+        for field in ("diskSizeGB", "diskSizeGb"):
+            changed = copy.deepcopy(model)
+            del changed["storageProfile"]["osDisk"]["diskSizeGb"]
+            disk_id = (deploy.base_id(self.config) + "/providers/Microsoft.Compute/disks/"
+                       + self.config["referenceVm"] + "-os")
+            changed["storageProfile"]["osDisk"]["managedDisk"]["id"] = disk_id
+            for size in (64, 31, None):
+                with self.subTest(field=field, size=size), \
+                        patch.object(self.engine, "az", return_value={"id": disk_id, field: size}) as azure:
+                    if size == 64:
+                        self.engine.check_reference_model(changed)
+                    else:
+                        with self.assertRaises(deploy.DeploymentError):
+                            self.engine.check_reference_model(changed)
+                azure.assert_called_once_with("disk", "show", "--ids", disk_id)
+        changed = copy.deepcopy(model)
+        changed["storageProfile"]["osDisk"]["diskSizeGB"] = changed["storageProfile"]["osDisk"].pop("diskSizeGb")
+        self.engine.check_reference_model(changed)
+
     def test_vm_put_has_bootdiagnostics_security_and_no_public_ip_at_creation(self):
         nic = {"NewNIC": {"id": deploy.base_id(self.config) + "/providers/Microsoft.Network/networkInterfaces/nic"}}
         key = self.workspace / "public"
@@ -834,6 +853,15 @@ class EvidenceTests(Fixture):
         for value in variants:
             with self.subTest(value=value), self.assertRaises(deploy.DeploymentError):
                 deploy.validate_gallery(value, self.profile, self.config)
+
+    def test_gallery_accepts_azure_region_display_name_but_rejects_another_region(self):
+        model = self.gallery()
+        region = model["properties"]["publishingProfile"]["targetRegions"][0]
+        region["name"] = "West US 3"
+        deploy.validate_gallery(model, self.profile, self.config)
+        region["name"] = "West US 2"
+        with self.assertRaisesRegex(deploy.DeploymentError, "replication region"):
+            deploy.validate_gallery(model, self.profile, self.config)
 
     def test_real_public_profile_is_only_actual_rsa3072_der_not_another_certificate(self):
         self.assertIsNotNone(shutil.which("openssl"), "OpenSSL is required for certificate-profile tests")

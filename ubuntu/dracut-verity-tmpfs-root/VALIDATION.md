@@ -7,14 +7,17 @@
 The Bash and PowerShell entry points share a Python deployment/cleanup engine.
 Local tests exercise configuration/plan guards, failure handling, resource
 ownership, publication and SSH evidence checks without Azure resources.
-The shared engine's 57 tests passed under both Linux and native Windows Python,
+The shared engine's 58 tests passed under both Linux and native Windows Python,
 including real RSA certificate-profile checks with OpenSSL; no tests were
 skipped. Bash argument/failure propagation and actual Windows PowerShell
 plan/network-option/failure handling checks passed. The existing 31
 recipe, attestation and guest-validation regressions also passed.
-They do not establish that the new automatic controller has completed a real
-deployment. The Gallery 1.0.4 results below were obtained through the manual
-workflow; do not relabel them as controller acceptance.
+The latest focused Linux suite passed 93 tests; native Windows passed the 64
+engine/guest-verifier tests. These local tests do not establish Azure behavior.
+The Gallery 1.0.4 results below were obtained through the manual workflow; do not
+relabel them as controller acceptance. A separate fresh-image managed flow passed
+with explicit recovery, as recorded below; an uninterrupted controller run remains
+unqualified.
 
 Live controller testing on 2026-11-13 successfully created the private builder
 and approved temporary test routing, submitted the large recipe request through
@@ -23,9 +26,8 @@ Azure CLI quota strings, Windows/WSL argument-size limits, byte-literal serial
 output and interleaved service messages in SSH boot-key publication. The fixes
 have focused local regressions, including rejection of ambiguous host keys;
 SSH authentication remains strict. A fresh corrected attempt was then rejected
-by the VM SKU availability preflight before resource allocation. Complete
-automatic image build, publication, CVM first/reboot acceptance and cleanup
-remain unqualified.
+by the VM SKU availability preflight before resource allocation. Those early
+attempts did not complete image build/publication or reference acceptance.
 
 Managed live retries exposed an APT package-index lock race during provisioning
 and managed-command configurations being reset to empty. Provisioning now waits
@@ -44,8 +46,8 @@ command removal across reboot, distinct boot IDs, retention gates and a
 deallocated-reference handoff without network changes. SSH access now requires
 the user to confirm or reconfigure approved networking; no existing NSG profile
 is copied and no public reference endpoint is automatically attached. This is
-not yet a demonstration of fresh automated managed acceptance or user-driven
-SSH connectivity on a newly deployed reference.
+not a user-driven SSH connectivity check. The recovered fresh managed acceptance
+below also does not qualify subsequent SSH connectivity.
 The earlier preflight incorrectly treated zone-only SKU restrictions as a
 regional prohibition; non-zonal requests now accept zone-only restrictions
 while continuing to reject location restrictions, with a focused regression.
@@ -59,6 +61,40 @@ tests; the existing qualification script and component tests remain separately
 invoked. Verity hash-tree generation, image/signature/format checks and live
 mount confirmation remain in the default flow.
 Earlier manual results below describe the previous full-scan verifier.
+
+### Fresh image and recovered managed acceptance, 2026-11-13
+
+The controller built a fresh image on a dedicated standard Ubuntu builder,
+including the installed patched native collector, and uploaded it directly using
+the builder's managed identity. Build took 18 minutes 28 seconds; upload plus full
+blob readback took 9 minutes 53 seconds. Gallery version 1.0.0 in the new run's
+separate Gallery completed replication with the exact signer/Microsoft template.
+
+The original command stopped after replication because Azure returned the display
+region `West US 3`, not `westus3`. Recovery normalized that readback, waited for
+stable provisioning, and exposed a second API-shape issue: the VM model omitted
+OS-disk size. The controller now reads the actual managed disk when necessary and
+accepts Azure CLI's `diskSizeGB`/`diskSizeGb` spellings, while still requiring 64 GiB.
+Focused Linux/Windows regressions cover both fixes.
+
+Explicit recovery reused the independently recorded build/published image and
+created the Intel TDX reference with Secure Boot, vTPM and `VMGuestStateOnly`.
+Managed acceptance passed on first boot and after an Azure-triggered real reboot:
+expected kernel/signer, mounted healthy read-only dm-verity lower, expected
+root/data/hash identities, tmpfs upper/work, agents/cloud-init and installed
+collector provenance. The measured 136 MiB / 2,051-inode workload disappeared
+after a distinct boot ID. No full guest disk scan or SDK/MAA request was made.
+
+Ownership-checked cleanup removed the builder, builder NIC/OS disk, source disk,
+upload storage and upload permission. Independent final Azure queries confirmed
+one retained reference VM, deallocated, with no temporary build/upload resources.
+Gallery and private-only reference networking remain for user-confirmed SSH
+access. The earlier manually qualified reference remained running and unchanged.
+
+Private evidence retains the original failures and marks the result
+`RECOVERED_ACCEPTANCE_COMPLETE` with `uninterruptedControllerRun: false`.
+All build/publication/first-reboot acceptance/cleanup stages ran against Azure,
+but this must not be presented as an uninterrupted one-command deployment pass.
 
 ## Evidence levels
 
@@ -79,6 +115,7 @@ Earlier manual results below describe the previous full-scan verifier.
 | Native patched collector / expanded PCRs | **Passed on 2026-11-13** directly in CVM tmpfs without firmware-log bind mounts: requested exactly `0-8,11,12`; real custom-policy MAA token signature/issuer/lifetime and signed values verified for `0-8,11`; explicit missing-PCR12 warning and incomplete-coverage receipt. Full results retrieved over authenticated SSH with matching SHA256 hashes |
 | Complete native-collector image rebuild | **Passed on 2026-11-13** on the retained dedicated builder using the same independently inspected source and signer: 104 SDK tests, pre-hash installed collector/wrapper/provenance gate, signed UKI sections, verity/corruption and fixed-VHD checks passed. Final output hashes and SSH-retrieved evidence archive verified |
 | Native-collector Gallery 1.0.4 / SSH acceptance | **Passed on 2026-11-13**: completed replication and exact signer/template readback; actual Intel TDX CVM first/reboot SSH acceptance with installed binary/wrapper/provenance checked on both boots; 136 MiB / 2,051 inode workload absent after distinct boot; installed collector obtained independently verified custom-policy MAA token for PCRs 0-8,11, with the PCR12 gap retained. Reference confirmed deallocated; previous Gallery versions and custom policy retained |
+| Fresh clean-room image / recovered managed flow | **Passed with explicit recovery on 2026-11-13**: automatic build/upload/Gallery replication, managed first/reboot mounted-verity acceptance, 136 MiB / 2,051-inode workload loss and cleanup/deallocated retention. No full disk scans/corruption qualification or SDK/MAA run. Uninterrupted one-command deployment remains unqualified |
 
 These tests are not simulated evidence of Azure firmware behavior. A UKI with
 a synthetic kernel payload proves packaging/signature/section binding only.

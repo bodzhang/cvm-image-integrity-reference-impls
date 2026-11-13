@@ -41,8 +41,11 @@ The Ubuntu 24.04 Dracut recipe now offers Bash/PowerShell entry points over a
 shared Python controller, as well as an independent
 [manual Linux workflow](ubuntu/dracut-verity-tmpfs-root/LOCAL-BUILD.md).
 Its controllers preserve the distinct Dracut/systemd signed-hash boot chain and
-use authenticated SSH for first/reboot and installed-collector checks. Their
-local/mock validation is separate from the demonstrated manual Azure flow.
+default to Managed Run Command for first/reboot mounted-verity acceptance.
+SDK execution is deferred to user-driven authenticated SSH; explicit SSH
+validation remains available. A fresh build/publication and recovered managed
+acceptance/cleanup passed in Azure; an uninterrupted controller run remains
+unqualified. This is separate from the demonstrated manual SSH/MAA flow.
 
 Keep run directories, image artifacts, credentials and raw guest evidence
 outside this checkout. Each configuration documents its own resource creation,

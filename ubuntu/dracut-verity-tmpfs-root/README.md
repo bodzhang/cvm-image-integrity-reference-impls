@@ -19,9 +19,10 @@ The effective root is a writable overlay backed by tmpfs over a read-only
 dm-verity lower; it has no writable disk fallback.
 
 **Experimental:** manual Gallery 1.0.4 publication, Intel TDX first/reboot SSH
-acceptance and installed native-collector MAA testing passed. The new shared
-deployment controller has local/mock validation, not a demonstrated fresh
-Azure deployment. PCR12 token coverage, stateless boot and production-complete
+acceptance and installed native-collector MAA testing passed. The shared controller
+built/uploaded a fresh image and completed Gallery replication; recovered managed
+first/reboot acceptance and cleanup also passed. An uninterrupted one-command
+deployment has not yet been demonstrated. PCR12 token coverage, stateless boot and production-complete
 expected-image remote verification remain unqualified.
 
 ## Supported baseline
@@ -241,9 +242,10 @@ python .\tests\test_deployment.py
 .\tests\Test-Entrypoints.ps1
 ```
 
-Local controller tests mock Azure/SSH. Neither passing mocks nor the earlier
-manual Gallery 1.0.4 run demonstrates the new automatic controller end to end.
-Real userspace/SDK tests and actual manual Azure results are distinguished in
+Local controller tests mock Azure/SSH. The fresh managed run required controller
+fixes and explicit recovery after publication; it is not an uninterrupted
+one-command pass. Real userspace/SDK tests, manual Gallery 1.0.4 results and
+the recovered managed Azure flow are distinguished in
 [VALIDATION.md](VALIDATION.md).
 
 Managed artifact retrieval reuses the legacy

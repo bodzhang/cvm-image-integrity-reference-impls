@@ -256,7 +256,8 @@ def validate_gallery(model, profile, config):
             "Unexpected Gallery version ID")
     require(model.get("tags", {}).get("runId") == config["runId"], "Gallery version ownership mismatch")
     regions = properties.get("publishingProfile", {}).get("targetRegions", [])
-    require(len(regions) == 1 and regions[0].get("name", "").lower() == config["location"].lower(),
+    require(len(regions) == 1
+            and regions[0].get("name", "").lower().replace(" ", "") == config["location"].lower(),
             "Gallery replication region differs from the requested region")
 
 
@@ -560,7 +561,17 @@ class Engine:
         require(p["securityType"] == "ConfidentialVM" and p["uefiSettings"] == {
             "secureBootEnabled": True, "vTpmEnabled": True},
             "Actual reference must have ConfidentialVM, Secure Boot and vTPM")
-        require(osdisk["diskSizeGb"] == 64 and
+        disk_size = osdisk.get("diskSizeGB", osdisk.get("diskSizeGb"))
+        if disk_size is None:
+            disk_id = osdisk["managedDisk"]["id"]
+            require(disk_id.lower() == (base_id(self.c) + "/providers/Microsoft.Compute/disks/"
+                                       + self.c["referenceVm"] + "-os").lower(),
+                    "Unexpected reference OS disk ID")
+            disk = self.az("disk", "show", "--ids", disk_id)
+            require(disk.get("id", "").lower() == disk_id.lower(), "Reference OS disk readback mismatch")
+            self.record("reference-disk", disk)
+            disk_size = disk.get("diskSizeGB", disk.get("diskSizeGb"))
+        require(type(disk_size) is int and disk_size == 64 and
                 osdisk["managedDisk"]["securityProfile"]["securityEncryptionType"] == "VMGuestStateOnly",
                 "Actual reference OS disk must be 64 GiB VMGuestStateOnly")
         require(model["storageProfile"]["imageReference"]["id"].lower() == version_id(self.c).lower(),
