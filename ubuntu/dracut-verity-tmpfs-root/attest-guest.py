@@ -11,7 +11,7 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
-PCRS = (0, 2, 4, 7, 11)
+PCRS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12)
 SDK = "/usr/local/bin/azure-guest-attest"
 SDK_BUILD = Path("/etc/cvm-verity/attestation-sdk.json")
 
@@ -50,7 +50,7 @@ def validate_response(response, endpoint):
     require(decode(evidence["Proof"]) and decode(evidence["RunTimeData"]), "Missing TEE proof or runtime data")
     tpm = request["TpmInfo"]
     require(tpm["PcrSet"] == list(PCRS) and all(type(index) is int for index in tpm["PcrSet"]),
-            "Submitted PCR set must include exactly 0,2,4,7,11")
+            "Submitted PCR set must include exactly 0-8,11,12")
     entries = tpm["PCRs"]
     require([entry["Index"] for entry in entries] == list(PCRS)
             and all(type(entry["Index"]) is int for entry in entries),
@@ -61,16 +61,35 @@ def validate_response(response, endpoint):
     for field in ("PcrQuote", "PcrSignature", "AikCert", "AikPub"):
         require(decode(tpm[field]), f"Missing TPM evidence: {field}")
     require(decode(request["TcgLogs"]), "Missing TPM event log for UKI measurement replay")
+    token_parts = response["token"].split(".")
+    require(len(token_parts) == 3 and all(token_parts), "Expected a signed MAA JWT")
+    claims = json.loads(decode(token_parts[1]))
+    require(isinstance(claims, dict), "Expected token claims object")
+    covered = claims.get("x-ms-azurevm-attested-pcrs")
+    require(isinstance(covered, list) and all(type(index) is int for index in covered)
+            and len(covered) == len(set(covered)) and set(covered).issubset(PCRS),
+            "Invalid token-reported PCR coverage")
+    require(set(PCRS) - {12} <= set(covered), "Token omits required PCR 0-8 or 11 coverage")
+    reported_values = claims.get("x-ms-azurevm-attested-pcr-values")
+    require(isinstance(reported_values, dict)
+            and set(reported_values) == {f"pcr{index}" for index in covered},
+            "Missing or inconsistent token-reported PCR values")
+    require(all(decode(reported_values[f"pcr{index}"]) == values[index] for index in covered),
+            "Token-reported PCR values differ from submitted values")
     return request, values[11].hex()
 
 
-def collect(endpoint, nonce, output):
+def collect(endpoint, nonce, output, sdk=None, sdk_build=None):
     validate_options(endpoint, nonce)
     require(os.geteuid() == 0, "Run with sudo for TPM access")
+    require((sdk is None) == (sdk_build is None), "Supply both SDK binary and build record overrides")
+    sdk = SDK if sdk is None else str(sdk)
+    sdk_build = SDK_BUILD if sdk_build is None else sdk_build
+    require(Path(sdk).is_absolute() and Path(sdk_build).is_absolute(), "SDK paths must be absolute")
     require(not output.exists(), "Output directory already exists")
     output.mkdir(mode=0o700, parents=False)
     command = [
-        SDK, "guest-attest", "--provider", "maa", "--endpoint", endpoint,
+        sdk, "guest-attest", "--provider", "maa", "--endpoint", endpoint,
         "--user-data", "hex:" + nonce, "--pcr-index", ",".join(map(str, PCRS)),
         "--json", "--show-request",
     ]
@@ -81,6 +100,11 @@ def collect(endpoint, nonce, output):
     require(result.returncode == 0, f"SDK failed ({result.returncode}); see {output}/sdk-stderr.log")
     response = json.loads(result.stdout)
     request, pcr11 = validate_response(response, endpoint)
+    claims = json.loads(decode(response["token"].split(".")[1]))
+    covered = claims["x-ms-azurevm-attested-pcrs"]
+    missing = sorted(set(PCRS) - set(covered))
+    if missing:
+        print("ATTESTATION_TOKEN_PCR_COVERAGE_GAP=" + json.dumps(missing), file=sys.stderr)
     (output / "request.json").write_text(json.dumps(request, indent=2) + "\n")
     (output / "token.txt").write_text(response["token"] + "\n")
     receipt = {
@@ -89,7 +113,17 @@ def collect(endpoint, nonce, output):
         "requestedPcrs": list(PCRS),
         "reportedPcr11Sha256": pcr11,
         "nonceHex": nonce,
-        "sdkBuild": json.loads(SDK_BUILD.read_text()),
+        "sdkBuild": json.loads(Path(sdk_build).read_text()),
+        "sdkPathUntrusted": sdk,
+        "tokenClaimsUnverified": {
+            "reportedPcrs": covered,
+            "reportedPcrValuesSha256": {
+                str(index): decode(claims["x-ms-azurevm-attested-pcr-values"][f"pcr{index}"]).hex()
+                for index in covered
+            },
+            "missingRequestedPcrs": missing,
+            "requestedCoverageComplete": not missing,
+        },
         "localCmdlineUntrusted": Path("/proc/cmdline").read_text().strip(),
     }
     (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
@@ -101,11 +135,13 @@ def main():
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--nonce", required=True, help="Verifier-generated 32-byte challenge in lowercase hex")
     parser.add_argument("--output", required=True, type=Path, help="New directory under /run; parent must exist")
+    parser.add_argument("--sdk", type=Path, help="Explicit test SDK binary; requires --sdk-build")
+    parser.add_argument("--sdk-build", type=Path, help="Build record for --sdk; both paths are locally untrusted")
     args = parser.parse_args()
     require(args.output.is_absolute() and Path("/run") in args.output.resolve().parents,
             "Store evidence in a new absolute directory under /run")
     os.umask(0o077)
-    print(json.dumps(collect(args.endpoint, args.nonce, args.output), indent=2))
+    print(json.dumps(collect(args.endpoint, args.nonce, args.output, args.sdk, args.sdk_build), indent=2))
 
 
 if __name__ == "__main__":

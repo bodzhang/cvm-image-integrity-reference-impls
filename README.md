@@ -10,7 +10,7 @@ shared boot trust chain.
 | Distribution | Configuration | Boot integration | Validation scope |
 | --- | --- | --- | --- |
 | Canonical Ubuntu 22.04 CVM | [Verity lower + volatile tmpfs upper](ubuntu/verity-tmpfs-root/README.md) | Custom initrd, signed UKI, Canonical snap-bootstrap manifest | Component flow demonstrated with Secure Boot/vTPM; parameterized controllers have local/CI tests |
-| Ubuntu 24.04 CVM | [Dracut verity lower + volatile tmpfs upper](ubuntu/dracut-verity-tmpfs-root/README.md) | Dracut/systemd initramfs; signed UKI embeds root hash and data/hash PARTUUIDs; no snap-bootstrap | Local policy and real userspace component tests; Marketplace conversion and Azure boot acceptance pending |
+| Ubuntu 24.04 CVM | [Dracut verity lower + volatile tmpfs upper](ubuntu/dracut-verity-tmpfs-root/README.md) | Dracut/systemd initramfs; signed UKI embeds root hash and data/hash PARTUUIDs; no snap-bootstrap | Marketplace conversion and persisted-TPM first/reboot acceptance passed on Intel TDX; custom-policy MAA token verified for PCRs 0-8,11; PCR12 coverage gap |
 | Azure Linux 3 | [Verity lower + volatile tmpfs upper](azure-linux/verity-tmpfs-root/README.md) | Image Customizer root verity/UKI and `systemd.volatile=overlay` | Functional Azure storage/boot repro; Secure Boot off, CVM qualification not established |
 
 See each configuration's `VALIDATION.md` before relying on its guarantees.

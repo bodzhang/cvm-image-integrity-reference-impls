@@ -35,6 +35,7 @@ jobs:
         run: |
           python3 ubuntu/dracut-verity-tmpfs-root/tests/test_recipe.py
           python3 ubuntu/dracut-verity-tmpfs-root/tests/test_attestation.py
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_guest_validation.py
       - name: Test real Dracut, dm-verity userspace and signed UKI packaging
         run: sudo python3 ubuntu/dracut-verity-tmpfs-root/tests/test_components.py
   ubuntu-attestation-sdk:
@@ -42,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
-      - name: Build the pinned SDK and check explicit PCR-selection CLI support
+      - name: Test and build the pinned SDK with native systemd log collection patch
         run: |
           bash ubuntu/dracut-verity-tmpfs-root/scripts/build-attestation.sh \
             "$RUNNER_TEMP/ubuntu-attestation-sdk"

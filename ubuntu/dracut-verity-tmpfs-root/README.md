@@ -11,9 +11,11 @@ volatile; the verified ext4 lower never has a writable fallback.
 
 **Status: experimental. Complete Marketplace conversion, custom-signed UKI
 boot and first-boot/real-reboot acceptance passed on an Azure Intel TDX CVM
-using `VMGuestStateOnly`. A tmpfs-only SDK diagnostic also obtained a
-signature-verified token from a custom-policy MAA endpoint. Stateless boot and
-the installed firmware-only collector remain unqualified.**
+using `VMGuestStateOnly`. The patched native SDK collector, tested directly in
+tmpfs without log bind mounts, also obtained a signature-verified custom-policy
+MAA token for PCRs 0-8 and 11. PCR12 remains a token-coverage gap. Stateless boot
+and expected-image remote verification remain unqualified; the retained Gallery
+1.0.3 image still contains the old firmware-only collector.**
 See [the observed evidence and limits](VALIDATION.md).
 Do not claim production integrity or remote image verification from these tests.
 
@@ -27,7 +29,7 @@ Do not claim production integrity or remote image verification from these tests.
 | Target userspace | Ubuntu 24.04, systemd 255 family, Dracut 060 family |
 | Kernel | Explicit version from the source UKI, with the **same source module tree** |
 | Signer | Caller-owned RSA certificate and private key, kept outside the checkout |
-| Guest attestation SDK | `Azure/azure-guest-attestation-sdk`, commit `8774be30f452060c56372d34ccbe34c3d3f3c577`; CLI `azure-guest-attest` |
+| Guest attestation SDK | `Azure/azure-guest-attestation-sdk`, commit `8774be30f452060c56372d34ccbe34c3d3f3c577` plus the pinned [native systemd event-log patch](patches/sdk-systemd-event-log.patch); CLI `azure-guest-attest` |
 | Builder | Exclusive Ubuntu 24.04 x86-64 Linux machine with root, mounts, loops and dm-verity |
 
 The pin is in [inputs.json](inputs.json). No kernel version is guessed from the
@@ -165,11 +167,13 @@ sudo apt-get install -y --no-install-recommends \
 
 The builder also needs an approved Rust toolchain (SDK minimum Rust 1.90;
 local/CI validation uses 1.95.0). The build fetches the exact SDK revision and
-compiles `azure-guest-attest` using its committed lockfile and default
-RustCrypto/rustls backend. It installs the binary, MIT license, provenance and
+checks and applies the recipe's SHA-256-pinned SDK patch, runs its event-log and
+guest-attestation unit tests, and compiles `azure-guest-attest` using its committed
+lockfile and default RustCrypto/rustls backend. It installs the binary, MIT license, provenance and
 the `cvm-attest` wrapper into the root **before hashing**, and checks that both
 commands run inside the target chroot. Compiler/binary/revision evidence is
-retained in `evidence/attestation-sdk.json`. No attestation request is made
+retained in `evidence/attestation-sdk.json`, including the base revision and patch
+file/hash. No attestation request is made
 during the offline build; no compiler or SDK source tree is baked into the guest.
 
 The build chroots into a **new copy** of the source and installs `dracut-core`,
@@ -298,21 +302,23 @@ Guest checks cannot establish Azure CVM security type by themselves.
 Deallocate or remove only your own test VM and temporary upload/source
 resources after acceptance. There is no automatic resource cleanup controller.
 
-## 5. Run PCR-11 guest attestation over SSH
+## 5. Run expanded-PCR guest attestation over SSH
 
 After deploying and completing root-policy acceptance, SSH into the CVM and
 run the installed `cvm-attest` command. No attestation service runs automatically,
 and no SDK download or compilation is required in the running guest.
 
-**Observed limitation:** the installed SDK reads only the firmware event log,
+**Existing-image limitation:** Gallery 1.0.3's installed SDK reads only the firmware event log,
 omitting genuine systemd boot-phase extensions into PCR 11. The tested shared
 West US 3 MAA endpoint rejects this with `PcrDoesNotMatchTcg`. A tmpfs-only
 diagnostic appended genuine recorded phase events and quoted PCRs `0-7,11`;
 the error advanced to a policy denial of `x-ms-azurevm-dbvalidated=false`.
 No token was issued by that shared endpoint. A separately owned endpoint,
 removing only the dbvalidated denial, subsequently issued a real token for the
-expanded diagnostic. The diagnostic does not change the installed collector
-or qualify its default PCR set. See [the attestation investigation](VALIDATION.md).
+expanded diagnostic. That diagnostic did not change the installed collector.
+Current source builds instead apply the native SDK fix described below and
+require the expanded PCR set. The retained Gallery 1.0.3 image has not been
+rebuilt or replaced. See [the attestation investigation](VALIDATION.md).
 
 ```bash
 # On the relying party: generate and retain a fresh challenge for this request.
@@ -326,7 +332,7 @@ sudo cvm-attest \
 ```
 
 The wrapper always invokes the pinned SDK's **guest** attestation flow with
-`--provider maa --pcr-index 0,2,4,7,11 --user-data hex:<nonce> --json --show-request`.
+`--provider maa --pcr-index 0,1,2,3,4,5,6,7,8,11,12 --user-data hex:<nonce> --json --show-request`.
 PCR 4 covers firmware image measurements, PCR 7 covers Secure Boot policy,
 and **PCR 11 covers systemd-stub's UKI section measurements**, including the
 embedded `.cmdline` with `roothash=` and the data/hash partition identifiers.
@@ -336,6 +342,33 @@ extensions also affect its value.
 Systemd does not measure journal contents into PCR 11: journal notices describe
 phase measurements, whose genuine userspace records are in
 `/run/log/systemd/tpm2-measure.log`.
+
+### Native userspace-log collection
+
+The fix belongs in the SDK, not in a guest mount-namespace workaround. This
+recipe carries [a patch over the pinned upstream SDK](patches/sdk-systemd-event-log.patch);
+[inputs.json](inputs.json) authenticates the expected patch bytes for the build.
+The Linux SDK reads the firmware log and genuine systemd JSON-sequence records,
+preserving firmware bytes and appending selected PCR11 phase records as TCG2
+`EV_IPL` events. It checks each recorded SHA1/SHA256/SHA384 digest against the
+actual phase string and declared firmware banks; it does not fabricate a
+hard-coded boot transcript or measure journal contents.
+
+This initial adapter supports **PCR11 systemd phase records only**, not arbitrary
+userspace schemas or IMA logs. Malformed input, unsupported selected measurement
+types/banks, unreadable logs and oversized logs fail explicitly. Records for
+unselected PCRs are not appended. A missing systemd log is explicitly logged,
+but firmware replay must still match the quote. Each input is bounded to 64 MiB.
+
+Before submission, the SDK checks the exact SHA256 quote selection and aggregate
+digest against the collected PCR values, and replays selected static PCRs 0-15.
+`EV_NO_ACTION` records are not extended; the patch also corrects Spec ID
+minor/major parsing. It retries collection at most three times, with 50-ms
+delays, only for replay/snapshot races; malformed/read errors are not retried.
+Dynamic PCRs 16+ are not replayed because their reset state is not established.
+These consistency checks do not authenticate the AK signature or expected UKI.
+The low-level `collect_tcg_logs` helper intentionally becomes fallible and takes
+the selected PCR indices; callers must handle the error.
 
 The SDK uses SHA-256 PCR reads and an AK-signed TPM quote for the explicit set;
 its `TpmInfo` request carries `PcrQuote`, `PcrSignature`, `PcrSet`, `PCRs`,
@@ -349,13 +382,39 @@ Evidence is private and volatile under the new `/run` directory:
 
 - `sdk-response.json`, `request.json`, `token.txt`, `sdk-stderr.log`;
 - `receipt.json` with requested PCRs, **reported** PCR 11, challenge and SDK
-  provenance; it explicitly says `NOT_VERIFIED`.
+  provenance; it explicitly says `NOT_VERIFIED`;
+- `tokenClaimsUnverified` in the receipt reports token coverage and raw PCR
+  values, without authenticating the JWT. Coverage and values must match the
+  request for PCRs 0-8 and 11. Missing PCR12 emits
+  `ATTESTATION_TOKEN_PCR_COVERAGE_GAP=[12]` and leaves coverage incomplete;
+  it is not silently removed from the request.
 
 Retrieve the evidence outside the guest before reboot. Protect tokens and raw
 VM-identifying evidence; do not commit them. Failed collection retains
 diagnostics but emits no success receipt. The request/receipt's local command
 line, metadata and PCR values are **not authenticated merely by collecting
 them or receiving a token**.
+
+To test updated code without rebuilding the protected image, build the patched
+SDK with [build-attestation.sh](scripts/build-attestation.sh) on the approved
+builder and stage its binary, `build.json` and this recipe's updated wrapper
+under a private `/run` directory using your approved transfer channel:
+
+```bash
+sudo python3 /run/cvm-sdk-test/attest-guest.py \
+  --sdk /run/cvm-sdk-test/azure-guest-attest \
+  --sdk-build /run/cvm-sdk-test/build.json \
+  --endpoint 'https://<your-approved-provider>.attest.azure.net' \
+  --nonce '<64-lowercase-hex-characters-from-the-relying-party>' \
+  --output /run/cvm-sdk-test/evidence
+```
+
+Both SDK overrides are required together and must be absolute paths. The SDK
+reads the genuine native log paths directly; no firmware-log bind mount is
+needed. Independently compare the transferred binary and patch hashes against
+your builder record. Guest-supplied SDK paths/build metadata are locally
+untrusted, not remote proof of which binary executed. This tmpfs test does not
+update the retained integrity image.
 
 ### What MAA does and what the verifier must check
 
@@ -421,8 +480,9 @@ needs independently authenticated expected signer/UKI measurements and the
 quote/TEE/freshness checks above. Keep genuine systemd userspace events in the
 attestation evidence; changing policy does not repair a PCR/event-log mismatch.
 The tested expanded diagnostic requests PCRs `0,1,2,3,4,5,6,7,8,11,12`.
-Neither this policy nor the tmpfs SDK diagnostic changes the installed
-collector's firmware-only input or its original exact PCR set.
+Neither this policy nor a tmpfs SDK diagnostic changes Gallery 1.0.3's installed
+firmware-only collector. Future recipe builds install the patched SDK and
+expanded-PCR wrapper before generating verity data.
 
 ## Threat model and limits
 
@@ -458,6 +518,7 @@ verity files and rejects corruption. It does not boot a synthetic or real CVM.
 Missing tools are test failures, not skipped checks. CI runs this configuration
 separately on Ubuntu 24.04 without Azure resource creation.
 The attestation wrapper tests use an SDK response double to check exact
-PCR/challenge arguments, retained evidence and failure handling. A separate CI
-job builds the actual pinned SDK and checks its CLI contract without TPM or MAA
+PCR/challenge arguments, token-coverage gap reporting, paired SDK overrides,
+retained evidence and failure handling. A separate CI job applies the pinned
+patch, runs actual SDK event-log/guest-attestation tests and checks its CLI contract without TPM or MAA
 access. Neither test proves actual Azure quote or MAA-token verification.

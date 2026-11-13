@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import base64
 import copy
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -21,7 +24,7 @@ def b64(value):
     return base64.b64encode(value).decode()
 
 
-def response_fixture():
+def response_fixture(complete=False):
     tpm = {
         "PcrSet": list(attest.PCRS),
         "PCRs": [{"Index": index, "Digest": b64(bytes([index + 1]) * 32)} for index in attest.PCRS],
@@ -36,9 +39,18 @@ def response_fixture():
             "Proof": b64(b"TEE-proof-fixture"), "RunTimeData": b64(b'{"user-data":"fixture"}'),
         }},
     }
+    covered = list(attest.PCRS if complete else attest.PCRS[:-1])
+    claims = {
+        "x-ms-azurevm-attested-pcrs": covered,
+        "x-ms-azurevm-attested-pcr-values": {
+            f"pcr{index}": b64(bytes([index + 1]) * 32) for index in covered
+        },
+    }
+    token = ".".join((b64(b'{"alg":"RS256"}'), b64(json.dumps(claims).encode()),
+                      b64(b"fixture-signature-not-verified")))
     return {
         "provider": "maa", "endpoint": ENDPOINT, "passed": True,
-        "token": "unverified-token-fixture", "request": json.dumps(request),
+        "token": token, "request": json.dumps(request),
     }
 
 
@@ -53,10 +65,12 @@ class AttestationTests(unittest.TestCase):
                     patch.object(attest, "SDK_BUILD", config), \
                     patch.object(attest.subprocess, "run", return_value=SimpleNamespace(
                         returncode=0, stdout=json.dumps(response))) as command:
-                receipt = attest.collect(ENDPOINT, NONCE, root / "output")
+                warning = io.StringIO()
+                with contextlib.redirect_stderr(warning):
+                    receipt = attest.collect(ENDPOINT, NONCE, root / "output")
             arguments = command.call_args.args[0]
             self.assertIn("guest-attest", arguments)
-            self.assertEqual(arguments[arguments.index("--pcr-index") + 1], "0,2,4,7,11")
+            self.assertEqual(arguments[arguments.index("--pcr-index") + 1], "0,1,2,3,4,5,6,7,8,11,12")
             self.assertEqual(arguments[arguments.index("--user-data") + 1], "hex:" + NONCE)
             self.assertNotIn("--client-payload", arguments)
             self.assertIn("--show-request", arguments)
@@ -64,7 +78,11 @@ class AttestationTests(unittest.TestCase):
             self.assertTrue(receipt["verification"].startswith("NOT_VERIFIED"))
             self.assertEqual(receipt["reportedPcr11Sha256"], "0c" * 32)
             self.assertEqual(json.loads((root / "output/request.json").read_text())["TpmInfo"]["PcrSet"],
-                             [0, 2, 4, 7, 11])
+                             [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12])
+            self.assertEqual(receipt["tokenClaimsUnverified"]["missingRequestedPcrs"], [12])
+            self.assertFalse(receipt["tokenClaimsUnverified"]["requestedCoverageComplete"])
+            self.assertEqual(receipt["tokenClaimsUnverified"]["reportedPcrValuesSha256"]["7"], "08" * 32)
+            self.assertIn("ATTESTATION_TOKEN_PCR_COVERAGE_GAP=[12]", warning.getvalue())
 
     def test_rejects_loopback_wrong_endpoint_and_token_absence(self):
         for change in ({"provider": "loopback"}, {"endpoint": "https://other.attest.azure.net"},
@@ -83,7 +101,7 @@ class AttestationTests(unittest.TestCase):
         request["TpmInfo"]["PcrSet"].remove(11)
         variants.append(request)
         request = copy.deepcopy(original)
-        request["TpmInfo"]["PCRs"][-1]["Digest"] = b64(bytes(32))
+        next(entry for entry in request["TpmInfo"]["PCRs"] if entry["Index"] == 11)["Digest"] = b64(bytes(32))
         variants.append(request)
         request = copy.deepcopy(original)
         request["TpmInfo"]["PCRs"][-1]["Digest"] = b64(b"short")
@@ -124,6 +142,64 @@ class AttestationTests(unittest.TestCase):
         sdk = json.loads((RECIPE / "inputs.json").read_text())["attestationSdk"]
         self.assertRegex(sdk["revision"], r"^[0-9a-f]{40}$")
         self.assertEqual(sdk["pcrs"], list(attest.PCRS))
+        self.assertEqual(sdk["patch"]["sha256"],
+                         hashlib.sha256((RECIPE / sdk["patch"]["file"]).read_bytes()).hexdigest())
+        build = (RECIPE / "scripts/build-attestation.sh").read_text()
+        self.assertIn('apply --check "$patch_path"', build)
+        self.assertIn('apply "$patch_path"', build)
+        self.assertIn('cargo test --locked', build)
+
+    def test_complete_token_coverage_is_reported_without_verification_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "sdk.json"
+            config.write_text('{"revision":"fixture"}')
+            with patch.object(attest.os, "geteuid", return_value=0), \
+                    patch.object(attest, "SDK_BUILD", config), \
+                    patch.object(attest.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps(response_fixture(complete=True)))):
+                receipt = attest.collect(ENDPOINT, NONCE, root / "output")
+            self.assertTrue(receipt["tokenClaimsUnverified"]["requestedCoverageComplete"])
+            self.assertEqual(receipt["tokenClaimsUnverified"]["missingRequestedPcrs"], [])
+            self.assertTrue(receipt["verification"].startswith("NOT_VERIFIED"))
+
+    def test_rejects_missing_required_token_coverage_and_wrong_raw_values(self):
+        original = response_fixture()
+        claims = json.loads(attest.decode(original["token"].split(".")[1]))
+        variants = []
+        for covered in ([0, 7], [0, 1, 2, 3, 4, 5, 6, 7, 8], [True], [0, 0], "0,7,11"):
+            changed = copy.deepcopy(claims)
+            changed["x-ms-azurevm-attested-pcrs"] = covered
+            variants.append(changed)
+        changed = copy.deepcopy(claims)
+        changed["x-ms-azurevm-attested-pcr-values"]["pcr7"] = b64(b"wrong" * 6)
+        variants.append(changed)
+        changed = copy.deepcopy(claims)
+        del changed["x-ms-azurevm-attested-pcr-values"]["pcr11"]
+        variants.append(changed)
+        for changed in variants:
+            token = original["token"].split(".")
+            token[1] = b64(json.dumps(changed).encode())
+            with self.subTest(claims=changed), self.assertRaises(ValueError):
+                attest.validate_response(dict(original, token=".".join(token)), ENDPOINT)
+        with self.assertRaises(ValueError):
+            attest.validate_response(dict(original, token="opaque"), ENDPOINT)
+
+    def test_tmpfs_sdk_overrides_are_explicit_and_paired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "patched-sdk"
+            build = root / "build.json"
+            build.write_text('{"patch":{"sha256":"fixture"}}')
+            with patch.object(attest.os, "geteuid", return_value=0), \
+                    patch.object(attest.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps(response_fixture()))) as command, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                receipt = attest.collect(ENDPOINT, NONCE, root / "output", sdk, build)
+            self.assertEqual(command.call_args.args[0][0], str(sdk))
+            self.assertEqual(receipt["sdkBuild"]["patch"]["sha256"], "fixture")
+            with patch.object(attest.os, "geteuid", return_value=0), self.assertRaisesRegex(ValueError, "both"):
+                attest.collect(ENDPOINT, NONCE, root / "other-output", sdk, None)
 
 
 if __name__ == "__main__":

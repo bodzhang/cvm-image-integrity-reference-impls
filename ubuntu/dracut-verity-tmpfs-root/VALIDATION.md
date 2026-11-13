@@ -10,7 +10,7 @@
 | Offline policy tests | 15 tests passed: generalized-source guards, writable-state finalization, pinned input, exact generated boot inputs, private mount-propagation enforcement, temporary resolver permissions/exact restoration, required switch-root dependency, volatile-service override, shared-parent setup and root-policy success/rejection paths |
 | Guest-verifier tests | 3 tests passed: completed clean cloud-init, explicit recoverable-warning reporting, and fatal/incomplete/malformed-status rejection |
 | Real userspace tests | SHA-256 verity format/verification and corrupted-data/wrong-hash rejection; kernel-less Dracut/systemd initramfs and RSA-signed systemd-stub UKI, exact section checks and changed-command-line rejection |
-| Pinned attestation SDK | Actual release CLI built from `8774be30f452060c56372d34ccbe34c3d3f3c577` with committed lockfile; PCR-selection/JSON CLI contract checked; wrapper tests request `0,2,4,7,11` and hardware-bound user data, reject incomplete evidence/fallback and do not claim remote verification |
+| Pinned patched attestation SDK | Exact recipe patch application and default RustCrypto release build passed: 34 event-log and 70 guest-attestation tests. Native backend passed those 104 plus 24 client regressions. Genuine retained firmware/userspace logs produced byte-identical supplementation and matched the actual CVM quote. Wrapper's 9 tests require `0-8,11,12`, report the PCR12 gap, check paired SDK overrides and reject incomplete evidence/fallback without claiming remote verification |
 | Complete Marketplace conversion | **Passed on 2026-11-12** using an unbooted disk from the exact Marketplace pin on a dedicated Ubuntu 24.04 Azure builder; complete build marker includes fixed-VHD validation |
 | Kernel/driver compatibility | Matching signed-module gates passed for original kernel `7.0.0-1016-azure-fde`; source configuration includes `CONFIG_INTEL_TDX_GUEST=y`; this kernel booted the tested Intel TDX `Standard_DC4es_v6` CVM |
 | Real live dm-verity corruption | **Passed in the complete image build**: disposable corrupted data rejected both offline verification and live mapper reads, with mapper status `C` |
@@ -18,6 +18,7 @@
 | Azure signer enrollment / CVM boot | Gallery 1.0.3 replication and exact custom signer/Microsoft template readback passed; `VMGuestStateOnly` booted with Secure Boot enabled and the independently expected signer present in actual firmware db. Initial and corrected-image `NonPersistedTPM` attempts reported Compute `SecureBootClientError` |
 | First boot / workload / real reboot | **Passed**: full verity verification and firmware/kernel/hash/device/agent checks on both boots; 136 MiB and 2,051 measured tmpfs inodes; distinct reboot ID and entire workload absent |
 | Actual PCR-11 quote / MAA flow | Installed SDK failed on omitted systemd phase events; genuine combined replay matches actual PCR 11. Tmpfs-only supplemented-log diagnostic obtained a real custom-policy MAA token: signature/issuer/lifetime and signed raw values verified for `0-8,11`. PCR 12 was requested but omitted from token coverage. **Installed collector and independent expected-UKI verification remain unqualified** |
+| Native patched collector / expanded PCRs | **Passed on 2026-11-13** directly in CVM tmpfs without firmware-log bind mounts: requested exactly `0-8,11,12`; real custom-policy MAA token signature/issuer/lifetime and signed values verified for `0-8,11`; explicit missing-PCR12 warning and incomplete-coverage receipt. Full results retrieved over authenticated SSH with matching SHA256 hashes |
 
 These tests are not simulated evidence of Azure firmware behavior. A UKI with
 a synthetic kernel payload proves packaging/signature/section binding only.
@@ -218,6 +219,48 @@ managed Run Command names were reused after deletion. The independent upload
 hash gate rejected the old build records before publication; they were
 quarantined and retrieved again using unique image-scoped command names. Do not
 accept a successful PUT or an old execution result as evidence of a new command.
+
+## Native SDK collector: direct tmpfs acceptance
+
+The SDK fix is carried as a patch over the pinned upstream revision, rather
+than replacing the firmware path through a private mount namespace. The patched
+default RustCrypto CLI and updated expanded-PCR wrapper were staged under
+`/run` on the retained Gallery 1.0.3 CVM. No VHD rebuild, replacement, reboot,
+Secure Boot change or provider-policy change was needed.
+
+The SDK read 46,764 firmware bytes and 1,424 genuine systemd userspace bytes,
+producing a 47,020-byte combined log. The actual transferred event-log bytes have
+SHA256 `724d08612131e01c1cf6074a7e1e30288cfb2a2d7e8a1a73f796d764a4a91e12`,
+identical to the earlier independently normalized genuine records. The requested
+PCR set was exactly `0,1,2,3,4,5,6,7,8,11,12`.
+
+The custom provider issued a real token. Independent verification checked its
+RS256 signature against trusted provider JWKS, expected issuer, current lifetime
+and signed raw values for PCRs 0-8 and 11 against the complete submitted request.
+PCR11 matches the genuine replay above. PCR12 is still absent from both signed
+claims; the wrapper explicitly warned and recorded incomplete coverage.
+The receipt remains `NOT_VERIFIED`; independent token verification is a separate
+test, not a new assertion by the guest wrapper.
+
+Native SDK binary SHA256:
+`9b7230a17bcb1a6e5ba9ad4fa88427ca49743fb58bd9ff9be0a97558a6374328`.
+Pinned patch SHA256:
+`8831ddc355fd5f03e77e5d12eabcdb204239ad11b325518335753f89d455e3bc`.
+Guest binary and receipt provenance matched the independent build record.
+
+Managed-command evidence retrieval was slow. SSH subsequently worked through
+existing corporate-network access rules, without opening public SSH ingress.
+The host key was authenticated against Azure boot diagnostics before login.
+The complete SDK response, receipt and stderr were retrieved over SSH and all
+file SHA256 hashes matched the guest. Raw tokens and VM-identifying evidence
+remain private. The custom endpoint and working Gallery image were freshly
+confirmed retained.
+
+Gallery 1.0.3's protected lower still contains the original collector; the tmpfs
+test does not update it. Future recipe builds install the patched SDK before
+verity generation. AK/quote/TEE authentication, fresh challenge-bound quotes and
+independent expected-UKI identity remain separate, unimplemented verification
+requirements; this test does not claim production remote image verification.
 
 ## Required before claiming a demonstrated configuration
 
