@@ -349,6 +349,23 @@ an arbitrary resource-group deletion command, nor a mechanism to delete local
 evidence. Removing the builder destroys its private signer; a later rebuild
 needs a new signer/enrollment unless you retained an approved signing service.
 
+## Offline expected PCR predictions
+
+After building, [predict-pcrs.py](scripts/predict-pcrs.py) can calculate SHA256
+PCR4, PCR7 and PCR11 from the final signed UKI, its exact signer DER, an
+independently approved/pinned firmware baseline and an explicit PCR11 phase
+path. It checks the UKI signature and emits JSON with expected PCRs, ordered
+event digests and PCR11 checkpoints. See the
+[baseline preparation and invocation](LOCAL-BUILD.md#optional-offline-pcr-prediction).
+
+This is opt-in post-build tooling; default builds and attestation validation
+are unchanged. The supported model is Azure direct-UKI boot with systemd-stub
+255 and exactly one appended custom db signer. Predictions matched the
+retained CVM's MAA-signed PCR4/7/11, but the qualification baseline is **not**
+a production-approved Microsoft factory template. Do not learn expected
+values from the CVM being evaluated or treat this calculator as a complete
+remote-attestation verifier.
+
 ## Limits
 
 - Every writable root change disappears at reboot, including identities,
