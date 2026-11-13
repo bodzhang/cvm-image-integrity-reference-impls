@@ -9,6 +9,7 @@ $parameters = @{
     SshPrivateKey = (Join-Path $run 'key with spaces')
     RunDirectory = $run
     MaaEndpoint = 'https://example.attest.azure.net'
+    ValidationTransport = 'ssh'
     SshSourceCidr = '10.20.30.0/24'
     SshJumpHost = 'relay@jump.example'
     SshJumpKnownHosts = (Join-Path $run 'jump known hosts')
@@ -31,6 +32,19 @@ if ($config.sshSourceCidr -ne $parameters.SshSourceCidr -or
 if ($config.sshJumpHost -ne $parameters.SshJumpHost -or
     $config.sshJumpKnownHosts -ne $parameters.SshJumpKnownHosts) {
     throw 'PowerShell deployment did not forward paired authenticated jump options.'
+}
+$managed = $parameters.Clone()
+foreach ($key in @('SshPrivateKey', 'SshSourceCidr', 'SshJumpHost', 'SshJumpKnownHosts', 'MaaEndpoint')) {
+    $managed.Remove($key)
+}
+$managed.ValidationTransport = 'managed'
+$managed.ReferenceNetworkTemplateNicId = (
+    '/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/approved' +
+    '/providers/Microsoft.Network/networkInterfaces/reference')
+$managedConfig = (& (Join-Path $recipe 'Deploy.ps1') @managed) | ConvertFrom-Json
+if ($managedConfig.validationTransport -ne 'managed' -or
+    $managedConfig.referenceNetworkTemplateNicId -ne $managed.ReferenceNetworkTemplateNicId) {
+    throw 'PowerShell deployment did not forward managed acceptance and the approved network template.'
 }
 if (Test-Path -LiteralPath $run) { throw 'Plan wrote a run directory.' }
 $parameters.Prefix = 'invalid prefix'

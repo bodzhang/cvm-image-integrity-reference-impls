@@ -8,6 +8,7 @@ Run Command is used only on the disposable builder, never for guest acceptance.
 import argparse
 import ast
 import base64
+import gzip
 import hashlib
 import importlib.util
 import io
@@ -32,8 +33,10 @@ CHECKOUT = RECIPE.parents[1]
 PURPOSE = "dracut-verity-tmpfs"
 BUILDER_IMAGE = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
 API = "2024-07-01"
+NETWORK_API = "2024-05-01"
 GALLERY_API = "2024-03-03"
 PCRS = list(range(9)) + [11, 12]
+ARTIFACT_READER = CHECKOUT / "ubuntu/verity-tmpfs-root/scripts/Read-ArtifactChunk.py"
 
 
 class DeploymentError(RuntimeError):
@@ -145,6 +148,12 @@ def configuration(args):
         source = ipaddress.ip_network(args.ssh_source_cidr)
         require(source.version == 4 and any(source.subnet_of(item) for item in private_ranges),
                 "SSH source must be an approved corporate RFC1918 CIDR, never Internet SSH")
+    if args.reference_network_template_nic_id:
+        require(re.fullmatch(
+            r"/subscriptions/" + re.escape(args.subscription_id)
+            + r"/resourceGroups/[^/]+/providers/Microsoft.Network/networkInterfaces/[^/]+",
+            args.reference_network_template_nic_id, re.IGNORECASE),
+            "Reference network template must be an explicit NIC ID in the deployment subscription")
     run = validate_run_path(args.run_directory or Path.home() / "cvm-dracut-runs" / args.prefix)
     run_id = str(uuid.uuid4())
     prefix = args.prefix
@@ -165,10 +174,15 @@ def configuration(args):
         "imageDefinition": "ubuntu2404-dracut-verity", "imageVersion": "1.0.0",
         "runDirectory": str(run), "sshPublicKey": str(key_path),
         "maaEndpoint": args.maa_endpoint,
+        "validationTransport": args.validation_transport,
+        "referenceNetworkTemplateNicId": args.reference_network_template_nic_id,
         "sshJumpHost": args.ssh_jump_host,
         "sshJumpKnownHosts": str(Path(args.ssh_jump_known_hosts).expanduser().resolve())
         if args.ssh_jump_known_hosts else None,
-        "privateConnectivity": "Controller must already have an approved route to the new private subnet; no inbound public IP",
+        "privateConnectivity": (
+            "Managed validation needs no inbound route; optional reference public SSH is enabled only after acceptance"
+            if args.validation_transport == "managed" else
+            "SSH validation requires an approved route to the new private subnet"),
         "attestationVerification": "NOT_VERIFIED: collection only; PCR12 token coverage may be absent",
     }
     return config
@@ -205,6 +219,32 @@ def azure_body_path(path):
         require(shutil.which("wslpath"), "WSL Windows Azure CLI requires wslpath for large request files")
         return command(["wslpath", "-w", str(path)]).stdout.decode().strip()
     return str(path)
+
+
+def network_rules(model):
+    fields = ("description", "protocol", "sourcePortRange", "sourcePortRanges",
+              "destinationPortRange", "destinationPortRanges", "sourceAddressPrefix",
+              "sourceAddressPrefixes", "destinationAddressPrefix", "destinationAddressPrefixes",
+              "access", "priority", "direction")
+    rules = []
+    for rule in model["properties"]["securityRules"]:
+        original = rule["properties"]
+        require(not original.get("sourceApplicationSecurityGroups")
+                and not original.get("destinationApplicationSecurityGroups"),
+                "Network templates with application security groups are not portable")
+        props = {key: original[key] for key in fields if original.get(key) not in (None, "", [])}
+        if props["direction"] == "Inbound" and props["access"] == "Allow" and props["protocol"] in ("Tcp", "*"):
+            ports = props.get("destinationPortRanges", []) + (
+                [props["destinationPortRange"]] if "destinationPortRange" in props else [])
+            ssh = any(port == "*" or int(port.split("-")[0]) <= 22 <= int(port.split("-")[-1])
+                      for port in ports)
+            sources = props.get("sourceAddressPrefixes", []) + (
+                [props["sourceAddressPrefix"]] if "sourceAddressPrefix" in props else [])
+            require(not ssh or sources and all(source.lower() not in (
+                "*", "internet", "0.0.0.0/0", "::/0") for source in sources),
+                "Reference network template must not allow unrestricted Internet SSH")
+        rules.append({"name": rule["name"], "properties": props})
+    return sorted(rules, key=lambda rule: rule["name"])
 
 
 def validate_public_key(path):
@@ -435,7 +475,9 @@ class Engine:
             skus = self.az("vm", "list-skus", "--location", self.c["location"], "--size", size,
                            "--all", "--resource-type", "virtualMachines")
             matches = [item for item in skus if item["name"] == size]
-            require(len(matches) == 1 and not matches[0].get("restrictions"), "VM SKU is restricted/unavailable")
+            require(len(matches) == 1 and all(
+                restriction.get("type") == "Zone" for restriction in matches[0].get("restrictions", [])),
+                "VM SKU is restricted/unavailable for a non-zonal deployment")
             sku = matches[0]
             capabilities = {item["name"]: item["value"] for item in sku["capabilities"]}
             cpus = int(capabilities["vCPUs"])
@@ -451,6 +493,8 @@ class Engine:
             require(int(values[0]) - int(values[1]) >= cpus,
                     "Insufficient regional/family VM quota: " + family)
         self.record("quota-preflight", {"needs": needs})
+        if self.c.get("referenceNetworkTemplateNicId"):
+            self.capture_reference_network()
 
     def network(self):
         c, group = self.c, self.c["resourceGroup"]
@@ -459,10 +503,11 @@ class Engine:
         self.owned_group()
         self.az("network", "nsg", "create", "-g", group, "-n", c["networkSecurityGroup"],
                 "-l", c["location"], "--tags", *self.tags("network"))
-        self.az("network", "nsg", "rule", "create", "-g", group, "--nsg-name", c["networkSecurityGroup"],
-                "-n", "corporate-private-ssh", "--priority", "100", "--access", "Allow",
-                "--protocol", "Tcp", "--direction", "Inbound", "--source-address-prefixes", c["sshSourceCidr"],
-                "--destination-port-ranges", "22")
+        if c["sshSourceCidr"]:
+            self.az("network", "nsg", "rule", "create", "-g", group, "--nsg-name", c["networkSecurityGroup"],
+                    "-n", "corporate-private-ssh", "--priority", "100", "--access", "Allow",
+                    "--protocol", "Tcp", "--direction", "Inbound", "--source-address-prefixes", c["sshSourceCidr"],
+                    "--destination-port-ranges", "22")
         self.az("network", "nsg", "rule", "create", "-g", group, "--nsg-name", c["networkSecurityGroup"],
                 "-n", "deny-other-ssh", "--priority", "110", "--access", "Deny", "--protocol", "Tcp",
                 "--direction", "Inbound", "--source-address-prefixes", "*", "--destination-port-ranges", "22")
@@ -478,6 +523,109 @@ class Engine:
                          "-n", c["subnet"], "--network-security-group", c["networkSecurityGroup"],
                          "--nat-gateway", c["natGateway"], "--service-endpoints", "Microsoft.Storage")
         self.record("subnet", subnet)
+
+    def capture_reference_network(self):
+        nic = self.az("network", "nic", "show", "--ids", self.c["referenceNetworkTemplateNicId"])
+        require(nic["id"].lower() == self.c["referenceNetworkTemplateNicId"].lower(),
+                "Network template NIC ID mismatch")
+        configs = nic["ipConfigurations"]
+        require(len(configs) == 1 and configs[0].get("publicIPAddress")
+                and nic.get("networkSecurityGroup"), "Network template requires one public NIC with an NSG")
+        subnet = self.az("network", "vnet", "subnet", "show", "--ids", configs[0]["subnet"]["id"])
+        require(subnet.get("networkSecurityGroup"), "Network template subnet must have an NSG")
+        public = self.az("network", "public-ip", "show", "--ids", configs[0]["publicIPAddress"]["id"])
+        require(public["sku"]["name"] == "Standard" and public["sku"].get("tier", "Regional") == "Regional"
+                and public["publicIPAllocationMethod"] == "Static"
+                and public["publicIPAddressVersion"] == "IPv4", "Template requires a static Standard IPv4 public IP")
+        rules = {}
+        for key, ident in (("nicRules", nic["networkSecurityGroup"]["id"]),
+                           ("subnetRules", subnet["networkSecurityGroup"]["id"])):
+            require(ident.lower().startswith("/subscriptions/" + self.c["subscriptionId"].lower() + "/"),
+                    "Network template NSG is outside the deployment subscription")
+            model = self.rest("get", ident, api=NETWORK_API)
+            rules[key] = network_rules(model)
+        self.record("reference-network-template", {
+            "sourceNicId": nic["id"], "sourceSubnetId": subnet["id"],
+            "publicIp": "Standard/Regional/Static/IPv4", **rules})
+
+    def enable_reference_ssh(self):
+        if not self.c.get("referenceNetworkTemplateNicId"):
+            return
+        self.owned_group()
+        template = read_json(self.evidence / "reference-network-template.json")
+        require(template["sourceNicId"].lower() == self.c["referenceNetworkTemplateNicId"].lower(),
+                "Reference network template evidence changed")
+        model = self.vm("reference")
+        self.check_reference_model(model)
+        view = self.az("vm", "get-instance-view", "-g", self.c["resourceGroup"], "-n", self.c["referenceVm"])
+        require(any(item["code"] == "PowerState/deallocated" for item in view["instanceView"]["statuses"]),
+                "Reference must be deallocated before publishing corporate SSH")
+        configs = model["networkProfile"]["networkInterfaces"]
+        require(len(configs) == 1, "Unexpected reference NIC inventory")
+        nic = self.owned(self.az("network", "nic", "show", "--ids", configs[0]["id"]), "reference")
+        require(len(nic["ipConfigurations"]) == 1, "Unexpected reference IP configuration inventory")
+        subnet_id = read_json(self.evidence / "subnet.json")["id"]
+        require(nic["ipConfigurations"][0]["subnet"]["id"].lower() == subnet_id.lower(),
+                "Reference NIC moved outside the owned subnet")
+        nsg_id = base_id(self.c) + "/providers/Microsoft.Network/networkSecurityGroups/"
+        subnet = self.az("network", "vnet", "subnet", "show", "--ids", subnet_id)
+        require(subnet.get("networkSecurityGroup", {}).get("id", "").lower()
+                == (nsg_id + self.c["networkSecurityGroup"]).lower(),
+                "Reference subnet is no longer protected by the owned NSG")
+        inventory = self.az("resource", "list", "-g", self.c["resourceGroup"])
+        reference_nsg = self.c["referenceVm"] + "-nsg"
+        public_name = self.c["referenceVm"] + "-ssh"
+        expected_public = base_id(self.c) + "/providers/Microsoft.Network/publicIPAddresses/" + public_name
+        existing = nic["ipConfigurations"][0].get("publicIPAddress")
+        require(not existing or existing["id"].lower() == expected_public.lower(),
+                "Refusing to replace an unexpected public IP")
+        for resource in inventory:
+            if resource["name"] in (reference_nsg, public_name):
+                self.owned(self.az("resource", "show", "--ids", resource["id"]), "reference")
+        for name, rules, role in (
+            (reference_nsg, template["nicRules"], "reference"),
+            (self.c["networkSecurityGroup"], template["subnetRules"], "network"),
+        ):
+            ident = nsg_id + name
+            if role == "network":
+                self.owned(self.rest("get", ident, api=NETWORK_API), role)
+            desired = {"location": self.c["location"], "tags": dict(item.split("=", 1) for item in self.tags(role)),
+                       "properties": {"securityRules": rules}}
+            network_rules(desired)
+            self.rest("put", ident, desired, api=NETWORK_API)
+            actual = self.poll(lambda: self.rest("get", ident, api=NETWORK_API),
+                               lambda item: item["properties"].get("provisioningState") == "Succeeded",
+                               "Reference SSH NSG configuration")
+            self.owned(actual, role)
+            require(network_rules(actual) == rules, "Reference SSH NSG differs from the approved template")
+        self.az("network", "nic", "update", "--ids", nic["id"],
+                "--network-security-group", nsg_id + reference_nsg)
+        self.az("network", "public-ip", "create", "-g", self.c["resourceGroup"], "-n", public_name,
+                "--sku", "Standard", "--allocation-method", "Static", "--version", "IPv4",
+                "--tags", *self.tags("reference"))
+        public = self.owned(self.az("network", "public-ip", "show", "-g", self.c["resourceGroup"],
+                                   "-n", public_name), "reference")
+        require(public["id"].lower() == expected_public.lower(), "Reference public IP ID mismatch")
+        require(public["sku"]["name"] == "Standard" and public["sku"].get("tier", "Regional") == "Regional"
+                and public["publicIPAllocationMethod"] == "Static"
+                and public["publicIPAddressVersion"] == "IPv4"
+                and ipaddress.ip_address(public["ipAddress"]).version == 4,
+                "Reference public IP differs from the approved static Standard IPv4 configuration")
+        self.az("network", "nic", "ip-config", "update", "-g", self.c["resourceGroup"],
+                "--nic-name", nic["name"], "-n", nic["ipConfigurations"][0]["name"],
+                "--public-ip-address", public["id"])
+        actual = self.owned(self.az("network", "nic", "show", "--ids", nic["id"]), "reference")
+        require(actual["networkSecurityGroup"]["id"].lower() == (nsg_id + reference_nsg).lower()
+                and actual["ipConfigurations"][0]["publicIPAddress"]["id"].lower() == public["id"].lower(),
+                "Reference public SSH attachment did not match")
+        subnet = self.az("network", "vnet", "subnet", "show", "--ids", subnet_id)
+        require(subnet["networkSecurityGroup"]["id"].lower() == (nsg_id + self.c["networkSecurityGroup"]).lower(),
+                "Reference subnet NSG association changed during SSH publication")
+        self.record("reference-ssh", {
+            "address": public["ipAddress"], "port": 22, "adminUsername": self.c["adminUsername"],
+            "sourceNicId": template["sourceNicId"], "referenceDeallocated": True,
+            "hostKeyAuthentication": "Authenticate the new host key through Azure diagnostics after each start",
+        })
 
     def boot_config(self):
         # Bootcmd runs again when the volatile root is recreated. Key material
@@ -562,15 +710,17 @@ class Engine:
         require(model["diagnosticsProfile"]["bootDiagnostics"]["enabled"] is True,
                 "Reference boot diagnostics are not enabled")
 
-    def managed(self, name, script, marker, timeout=7200):
+    def managed(self, name, script, marker, timeout=7200, *, role="builder"):
+        require(role in ("builder", "reference"), "Invalid managed-command VM role")
         self.owned_group()
-        self.vm("builder")
+        self.vm(role)
         ident = (base_id(self.c) + "/providers/Microsoft.Compute/virtualMachines/"
-                 + self.c["builderVm"] + "/runCommands/" + name)
-        body = {"location": self.c["location"], "tags": dict(item.split("=", 1) for item in self.tags("builder")),
+                 + self.c[role + "Vm"] + "/runCommands/" + name)
+        body = {"location": self.c["location"], "tags": dict(item.split("=", 1) for item in self.tags(role)),
                 "properties": {"source": {"script": script}, "asyncExecution": True,
                                "timeoutInSeconds": timeout}}
         self.rest("put", ident, body)
+        start_deadline = time.monotonic() + 600
         def fetch():
             result = self.rest("get", ident, expand="instanceView")
             self.record(name + "-runcommand", result)
@@ -579,12 +729,15 @@ class Engine:
             view = result.get("properties", {}).get("instanceView", {})
             state = view.get("executionState", "")
             require(state not in ("Failed", "TimedOut", "Canceled", "Cancelled"),
-                    "Builder managed command failed: " + name)
+                    "Managed command failed: " + name)
+            require(state in ("Running", "Succeeded") or time.monotonic() < start_deadline,
+                    "Managed command did not start: " + name)
             return state == "Succeeded"
-        result = self.poll(fetch, done, "Builder command " + name, timeout + 600)
+        result = self.poll(fetch, done, "Managed command " + name, timeout + 600)
         view = result["properties"]["instanceView"]
         require(view.get("exitCode") == 0 and marker in view.get("output", ""),
-                "Builder command exit code/terminal marker did not pass: " + name)
+                "Managed command exit code/terminal marker did not pass: " + name)
+        return result
 
     def address(self, role):
         model = self.vm(role)
@@ -668,6 +821,8 @@ class Engine:
 
     def retrieve(self, role, remote, local):
         require(not re.search(r"private|\.key(?:$|/)", remote, re.I), "Private signing keys never leave the builder")
+        if self.c.get("validationTransport", "ssh") == "managed":
+            return self.retrieve_managed(role, remote, local)
         quoted = shlex.quote(remote)
         expected = self.ssh(role, "sudo sha256sum -- " + quoted).stdout.decode().split()[0]
         require(re.fullmatch(r"[0-9a-f]{64}", expected), "Remote artifact hash is malformed")
@@ -676,6 +831,51 @@ class Engine:
         private_write(local, content)
         self.record(Path(local).name + "-transfer", {"remote": remote, "sha256": expected, "bytes": len(content)})
         return content
+
+    def retrieve_managed(self, role, remote, local):
+        require(not Path(local).exists(), "Refusing to overwrite retrieved evidence")
+        encoded_path = base64.b64encode(remote.encode()).decode()
+        chunks, expected, index, encoded = None, None, 0, []
+        while chunks is None or index < chunks:
+            script = ("#!/bin/bash\nset -euo pipefail\npython3 - "
+                      + shlex.quote(encoded_path) + " " + str(index) + " <<'CVM_ARTIFACT'\n"
+                      + ARTIFACT_READER.read_text() + "\nCVM_ARTIFACT\n")
+            result = self.managed("cvm-read-" + uuid.uuid4().hex, script,
+                                  "MANAGED_ARTIFACT_CHUNK_READY", timeout=300, role=role)
+            lines = [line for line in result["properties"]["instanceView"]["output"].splitlines()
+                     if line.startswith("{")]
+            require(len(lines) == 1, "Managed artifact response is missing or truncated")
+            chunk = json.loads(lines[0])
+            require(type(chunk.get("chunks")) is int and chunk["chunks"] >= 1
+                    and type(chunk.get("index")) is int and chunk["index"] == index
+                    and re.fullmatch(r"[0-9a-f]{64}", chunk.get("sha256", ""))
+                    and isinstance(chunk.get("payload"), str), "Malformed managed artifact chunk")
+            if index == 0:
+                chunks, expected = chunk["chunks"], chunk["sha256"]
+            require(chunk["chunks"] == chunks and chunk["sha256"] == expected,
+                    "Managed artifact changed during retrieval")
+            encoded.append(chunk["payload"])
+            index += 1
+        content = gzip.decompress(base64.b64decode("".join(encoded), validate=True))
+        require(digest(content) == expected, "Managed artifact transfer hash mismatch")
+        private_write(local, content)
+        self.record(Path(local).name + "-transfer", {
+            "transport": "managed", "remote": remote, "sha256": expected, "bytes": len(content)})
+        return content
+
+    def remove_reference_commands(self):
+        self.owned_group()
+        self.vm("reference")
+        def commands():
+            return [item for item in self.az("vm", "run-command", "list", "-g", self.c["resourceGroup"],
+                                            "--vm-name", self.c["referenceVm"])
+                    if (item.get("tags") or {}).get("runId") == self.c["runId"]
+                    and (item.get("tags") or {}).get("purpose") == PURPOSE
+                    and (item.get("tags") or {}).get("role") == "reference"]
+        for item in commands():
+            self.owned(item, "reference")
+            self.rest("delete", item["id"])
+        self.poll(commands, lambda items: not items, "Reference managed-command removal", timeout=600)
 
     def build(self):
         payload, manifest = recipe_archive()
@@ -694,7 +894,8 @@ class Engine:
             + (RECIPE / "scripts/deployment-builder.sh").read_text() + "\nCVM_BUILDER_SCRIPT\n"
             "bash /var/lib/cvm-dracut/builder.sh provision\n")
         self.managed("provision", stage, "DRACUT_BUILDER_PROVISIONED", timeout=3600)
-        self.bootstrap("builder", "first")
+        if self.c.get("validationTransport", "ssh") == "ssh":
+            self.bootstrap("builder", "first")
         # The source has never been booted, and is attached only now.
         disk = self.az("disk", "create", "-g", self.c["resourceGroup"], "-n", self.c["sourceDisk"],
                        "--location", self.c["location"], "--image-reference", self.c["sourceImage"],
@@ -851,6 +1052,8 @@ class Engine:
                 "Upload storage must deny public access/shared keys and allow only the builder subnet plus trusted Azure services")
 
     def acceptance(self, build):
+        if self.c.get("validationTransport", "ssh") == "managed":
+            return self.acceptance_managed(build)
         first_boot = self.bootstrap("reference", "first")
         root = "/run/cvm-controller-" + self.c["runId"]
         self.ssh("reference", "sudo install -d -m 700 " + shlex.quote(root))
@@ -908,6 +1111,45 @@ class Engine:
                             "AK certificate/TPM quote not independently verified",
                             "Event log not independently replayed against expected UKI/PCR11",
                             "Token PCR12 coverage may be absent; no claim of PCR12 attestation"],
+        })
+
+    def acceptance_managed(self, build):
+        previous = None
+        root = "/run/cvm-controller-" + self.c["runId"]
+        for phase in ("first", "reboot"):
+            script = "#!/bin/bash\nset -euo pipefail\numask 077\n"
+            script += "test ! -e " + shlex.quote(root) + "\ninstall -d -m 700 " + shlex.quote(root) + "\n"
+            for path, name in ((RECIPE / "verify-guest.py", "verify-guest.py"),
+                               (self.evidence / "build.json", "build.json"),
+                               (self.evidence / "signer.der", "signer.der")):
+                data = path.read_bytes()
+                destination = shlex.quote(root + "/" + name)
+                script += "printf %s " + base64.b64encode(data).decode() + " | base64 -d > " + destination + "\n"
+                script += "echo " + shlex.quote(digest(data) + "  " + root + "/" + name) + " | sha256sum -c -\n"
+            script += "python3 " + " ".join(shlex.quote(root + "/" + name)
+                                          for name in ("verify-guest.py", "build.json", "signer.der"))
+            if previous:
+                script += " --previous-boot-id " + shlex.quote(previous)
+            script += " > " + shlex.quote(root + "/acceptance.json") + "\necho CVM_MANAGED_ACCEPTANCE_PASSED\n"
+            self.managed("cvm-reference-" + phase, script, "CVM_MANAGED_ACCEPTANCE_PASSED",
+                         timeout=1800, role="reference")
+            content = self.retrieve("reference", root + "/acceptance.json",
+                                    self.evidence / ("acceptance-" + phase + ".json"))
+            boot = validate_acceptance(json.loads(content), build, previous)
+            self.remove_reference_commands()
+            if phase == "first":
+                previous = boot
+                self.az("vm", "restart", "-g", self.c["resourceGroup"], "-n", self.c["referenceVm"],
+                        timeout=600)
+        self.record("acceptance-complete", {
+            "result": "ACCEPTANCE_COMPLETE", "runId": self.c["runId"],
+            "validationTransport": "managed", "beforeBootId": previous, "afterBootId": boot,
+            "buildSha256": digest((self.evidence / "build.json").read_bytes()),
+            "signerSha256": digest((self.evidence / "signer.der").read_bytes()),
+            "attestationCollection": "DEFERRED_TO_SSH",
+            "attestationVerification": "NOT_RUN: invoke the installed collector over authenticated SSH after start",
+            "limitations": ["Managed basic acceptance does not test SSH connectivity or obtain an MAA token",
+                            "Expected-image remote verification and PCR12 token coverage remain unqualified"],
         })
 
     def validate_attestation_files(self, local, nonce, build):
@@ -987,11 +1229,18 @@ class Engine:
         after = validate_acceptance(read_json(self.evidence / "acceptance-reboot.json"), build, before)
         require(summary.get("beforeBootId") == before and summary.get("afterBootId") == after,
                 "Acceptance boot evidence changed")
-        challenge = read_json(self.evidence / "challenge.json")
-        require(challenge["bootId"] == after and challenge["endpoint"] == self.c["maaEndpoint"],
-                "Attestation challenge is not tied to the accepted boot/endpoint")
-        validate_receipt(read_json(self.evidence / "attestation/receipt.json"), challenge["nonceHex"], build)
-        self.validate_attestation_files(self.evidence / "attestation", challenge["nonceHex"], build)
+        transport = self.c.get("validationTransport", "ssh")
+        require(summary.get("validationTransport", "ssh") == transport, "Acceptance transport changed")
+        if transport == "managed":
+            require(summary.get("attestationCollection") == "DEFERRED_TO_SSH"
+                    and summary.get("attestationVerification", "").startswith("NOT_RUN:"),
+                    "Managed acceptance must explicitly defer attestation to SSH")
+        else:
+            challenge = read_json(self.evidence / "challenge.json")
+            require(challenge["bootId"] == after and challenge["endpoint"] == self.c["maaEndpoint"],
+                    "Attestation challenge is not tied to the accepted boot/endpoint")
+            validate_receipt(read_json(self.evidence / "attestation/receipt.json"), challenge["nonceHex"], build)
+            self.validate_attestation_files(self.evidence / "attestation", challenge["nonceHex"], build)
         profile = public_profile((self.evidence / "signer.der").read_bytes())
         gallery = self.rest("get", version_id(self.c), api=GALLERY_API, expand="ReplicationStatus,UefiSettings")
         validate_gallery(gallery, profile, self.c)
@@ -1054,8 +1303,12 @@ class Engine:
         require(not any(item["name"] in temporary for item in remaining), "Temporary resources remain after cleanup")
         vms = self.az("vm", "list", "-g", self.c["resourceGroup"])
         require(len(vms) == 1 and vms[0]["name"] == self.c["referenceVm"], "Unexpected retained VM inventory")
+        self.enable_reference_ssh()
+        remaining = self.az("resource", "list", "-g", self.c["resourceGroup"])
         self.record("cleanup-summary", {"temporaryResourcesDeleted": True, "referenceDeallocated": True,
-                                       "galleryVersion": version_id(self.c), "resources": remaining})
+                                       "galleryVersion": version_id(self.c), "resources": remaining,
+                                       "referenceSsh": read_json(self.evidence / "reference-ssh.json")
+                                       if self.c.get("referenceNetworkTemplateNicId") else None})
 
     def deploy(self):
         try:
@@ -1083,6 +1336,10 @@ def parser():
     deploy.add_argument("--vm-size", default="Standard_DC4es_v6")
     deploy.add_argument("--run-directory")
     deploy.add_argument("--maa-endpoint")
+    deploy.add_argument("--validation-transport", choices=("managed", "ssh"), default="managed",
+                        help="Managed basic acceptance by default; ssh also collects installed SDK evidence")
+    deploy.add_argument("--reference-network-template-nic-id",
+                        help="Approved existing public NIC whose NIC/subnet NSG rules are copied after acceptance")
     deploy.add_argument("--ssh-source-cidr", help="Approved corporate RFC1918 source; controller must have private routing")
     deploy.add_argument("--ssh-jump-host", help="Optional user@host on an existing approved SSH path; uses the same private key")
     deploy.add_argument("--ssh-jump-known-hosts", help="Independently authenticated ED25519 known-hosts file for --ssh-jump-host")
@@ -1104,26 +1361,35 @@ def main(argv=None):
         if args.plan:
             print(json.dumps(config, indent=2))
             return 0
-        require(args.ssh_private_key, "Actual deployment requires --ssh-private-key")
-        require(args.maa_endpoint, "Actual deployment requires an approved --maa-endpoint; no provider/policy will be created")
-        require(args.ssh_source_cidr, "Actual deployment requires --ssh-source-cidr and approved private reachability")
+        ssh_validation = args.validation_transport == "ssh"
+        if ssh_validation:
+            require(args.ssh_private_key, "SSH validation requires --ssh-private-key")
+            require(args.maa_endpoint, "SSH validation requires an approved --maa-endpoint; no provider/policy will be created")
+            require(args.ssh_source_cidr, "SSH validation requires --ssh-source-cidr and approved private reachability")
+        else:
+            require(not (args.ssh_private_key or args.ssh_source_cidr or args.ssh_jump_host),
+                    "Managed validation does not use SSH credentials/routing options; select --validation-transport ssh")
+            require(ARTIFACT_READER.is_file(),
+                    "Managed artifact retrieval requires the full checkout and legacy Read-ArtifactChunk.py helper")
         validate_public_key(Path(config["sshPublicKey"]))
-        for tool in ("az", "ssh", "ssh-keygen", "tar", "openssl"):
+        for tool in ("az", "tar", "openssl") + (("ssh", "ssh-keygen") if ssh_validation else ()):
             require(shutil.which(tool), "Missing required tool: " + tool)
-        private = Path(args.ssh_private_key).expanduser().resolve()
-        require(private.is_file(), "SSH private key file does not exist")
+        private = Path(args.ssh_private_key).expanduser().resolve() if ssh_validation else None
+        if ssh_validation:
+            require(private.is_file(), "SSH private key file does not exist")
         if config["sshJumpHost"]:
             known = Path(config["sshJumpKnownHosts"])
             require(known.is_file(), "SSH jump known-hosts file does not exist")
             host = config["sshJumpHost"].split("@")[1]
             command(["ssh-keygen", "-F", host, "-f", known])
-        if os.name != "nt":
+        if ssh_validation and os.name != "nt":
             require(private.stat().st_mode & 0o077 == 0, "SSH private key must have mode 0600 or stricter")
-        private_fingerprint = command(["ssh-keygen", "-lf", private]).stdout.decode().split()
-        public_fingerprint = command(["ssh-keygen", "-lf", config["sshPublicKey"]]).stdout.decode().split()
-        require(len(private_fingerprint) >= 2 and len(public_fingerprint) >= 2
-                and private_fingerprint[1] == public_fingerprint[1],
-                "SSH private/public key pair does not match (encrypted keys need a noninteractive SSH agent)")
+        if ssh_validation:
+            private_fingerprint = command(["ssh-keygen", "-lf", private]).stdout.decode().split()
+            public_fingerprint = command(["ssh-keygen", "-lf", config["sshPublicKey"]]).stdout.decode().split()
+            require(len(private_fingerprint) >= 2 and len(public_fingerprint) >= 2
+                    and private_fingerprint[1] == public_fingerprint[1],
+                    "SSH private/public key pair does not match (encrypted keys need a noninteractive SSH agent)")
         run = Path(config["runDirectory"])
         run.parent.mkdir(parents=True, exist_ok=True)
         run.mkdir(mode=0o700)
@@ -1134,8 +1400,9 @@ def main(argv=None):
             private_write(run / "ssh-jump.config", jump_configuration(config, private))
         if os.name == "nt":
             print("WARNING: Windows ACLs are inherited; the run directory's parent must already be restricted to the operator. POSIX modes do not enforce Windows ACLs.", file=sys.stderr)
-        Engine(config, str(private)).deploy()
-        print("DEPLOYMENT_ACCEPTED: Gallery retained; reference deallocated; attestation NOT_VERIFIED; evidence=" + str(run))
+        Engine(config, str(private) if private else None).deploy()
+        attestation = "NOT_VERIFIED" if ssh_validation else "NOT_RUN; collect over authenticated SSH after start"
+        print("DEPLOYMENT_ACCEPTED: Gallery retained; reference deallocated; attestation " + attestation + "; evidence=" + str(run))
     else:
         run = validate_run_path(args.run_directory, must_be_new=False)
         config = read_json(run / "config.json")

@@ -8,6 +8,8 @@ param(
     [string] $VmSize = 'Standard_DC4es_v6',
     [string] $RunDirectory,
     [string] $MaaEndpoint,
+    [ValidateSet('managed', 'ssh')][string] $ValidationTransport = 'managed',
+    [string] $ReferenceNetworkTemplateNicId,
     [string] $SshSourceCidr,
     [string] $SshJumpHost,
     [string] $SshJumpKnownHosts,
@@ -32,6 +34,10 @@ $arguments = @(
     '--resource-group', $ResourceGroup, '--prefix', $Prefix,
     '--ssh-public-key', $SshPublicKey, '--location', $Location, '--vm-size', $VmSize
 )
+$arguments += @('--validation-transport', $ValidationTransport)
+if ($ReferenceNetworkTemplateNicId) {
+    $arguments += @('--reference-network-template-nic-id', $ReferenceNetworkTemplateNicId)
+}
 if ($SshPrivateKey) { $arguments += @('--ssh-private-key', $SshPrivateKey) }
 if ($RunDirectory) { $arguments += @('--run-directory', $RunDirectory) }
 if ($MaaEndpoint) { $arguments += @('--maa-endpoint', $MaaEndpoint) }

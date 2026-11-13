@@ -7,7 +7,7 @@
 The Bash and PowerShell entry points share a Python deployment/cleanup engine.
 Local tests exercise configuration/plan guards, failure handling, resource
 ownership, publication and SSH evidence checks without Azure resources.
-The shared engine's 49 tests passed under both Linux and native Windows Python,
+The shared engine's 57 tests passed under both Linux and native Windows Python,
 including real RSA certificate-profile checks with OpenSSL; no tests were
 skipped. Bash argument/failure propagation and actual Windows PowerShell
 plan/network-option/failure handling checks passed. The existing 29
@@ -26,6 +26,20 @@ SSH authentication remains strict. A fresh corrected attempt was then rejected
 by the VM SKU availability preflight before resource allocation. Complete
 automatic image build, publication, CVM first/reboot acceptance and cleanup
 remain unqualified.
+
+The default workflow now uses Managed Run Command for build-artifact retrieval
+and first/reboot basic acceptance; installed collector provenance is still
+checked, but SDK execution is explicitly deferred to SSH (`NOT_RUN`).
+Focused tests cover multi-chunk integrity, unchanged-artifact enforcement,
+command removal across reboot, distinct boot IDs, retention gates and opt-in
+reference-only public SSH after deallocation. An explicitly approved existing
+NIC supplies both NIC/subnet NSG rule sets; unrestricted Internet SSH and
+nonportable application security groups are rejected. The approved live
+reference's two eight-rule profiles were captured read-only. This is not yet a
+demonstration of fresh automated public-SSH publication or managed acceptance.
+The earlier preflight incorrectly treated zone-only SKU restrictions as a
+regional prohibition; non-zonal requests now accept zone-only restrictions
+while continuing to reject location restrictions, with a focused regression.
 
 ## Evidence levels
 

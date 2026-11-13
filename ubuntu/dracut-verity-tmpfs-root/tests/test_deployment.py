@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 import tarfile
 import unittest
 from unittest.mock import Mock, patch
@@ -44,6 +45,7 @@ class Fixture(unittest.TestCase):
             "--run-directory", str(self.workspace / "runs" / "new"),
             "--maa-endpoint", "https://approved.attest.azure.net",
             "--ssh-source-cidr", "10.80.1.0/24",
+            "--validation-transport", "ssh",
         ]
         self.config = deploy.configuration(deploy.parser().parse_args(self.arguments))
         self.run = Path(self.config["runDirectory"])
@@ -307,7 +309,7 @@ class AzureBoundaryTests(Fixture):
                 self.assertRaisesRegex(deploy.DeploymentError, "timed out"):
             self.engine.poll(lambda: {}, bool, "test", timeout=10)
 
-    def test_managed_commands_are_builder_only_and_require_marker_plus_exit(self):
+    def test_managed_commands_default_to_builder_and_require_marker_plus_exit(self):
         for exit_code, output, state in ((1, "PASSED", "Succeeded"), (0, "missing", "Succeeded"),
                                          (0, "PASSED", "Failed")):
             response = {"properties": {"instanceView": {
@@ -318,6 +320,28 @@ class AzureBoundaryTests(Fixture):
                     self.assertRaises(deploy.DeploymentError):
                 self.engine.managed("test", "echo PASSED", "PASSED")
             vm.assert_called_once_with("builder")
+
+    def test_zonal_restrictions_do_not_block_non_zonal_vms_but_location_restrictions_do(self):
+        for kind, accepted in (("Zone", True), ("Location", False)):
+            def azure(*args):
+                if args[:2] == ("group", "exists"):
+                    return False
+                if args[:2] == ("vm", "image"):
+                    return {}
+                if args[:2] == ("vm", "list-usage"):
+                    return [{"name": {"value": family}, "limit": 32, "currentValue": 0}
+                            for family in ("cores", "family")]
+                if args[:2] == ("vm", "list-skus"):
+                    return [{"name": args[args.index("--size") + 1], "family": "family",
+                             "restrictions": [{"type": kind, "reasonCode": "NotAvailableForSubscription"}],
+                             "capabilities": [{"name": "vCPUs", "value": "8"}]}]
+                self.fail("Unexpected Azure call")
+            with self.subTest(kind=kind), patch.object(self.engine, "az", side_effect=azure):
+                if accepted:
+                    self.engine.preflight()
+                else:
+                    with self.assertRaises(deploy.DeploymentError):
+                        self.engine.preflight()
 
     def test_vm_creation_cap_prevents_third_or_duplicate_vm(self):
         for inventory in ([{"name": "one"}, {"name": "two"}],
@@ -499,6 +523,198 @@ class SSHTests(Fixture):
                 subprocess.CompletedProcess([], 0, b"changed", b"")]), self.assertRaisesRegex(deploy.DeploymentError, "hash mismatch"):
             self.engine.retrieve("builder", "/owned/build.json", self.engine.evidence / "bad")
         self.assertFalse((self.engine.evidence / "bad").exists())
+
+
+class ManagedAcceptanceTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.config["validationTransport"] = "managed"
+
+    def test_managed_execution_needs_no_private_key_ssh_tools_or_maa(self):
+        args = self.arguments[:]
+        args[args.index("--validation-transport") + 1] = "managed"
+        args[args.index("--run-directory") + 1] = str(self.workspace / "managed-run")
+        for flag in ("--maa-endpoint", "--ssh-source-cidr"):
+            index = args.index(flag)
+            del args[index:index + 2]
+        wire = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + b"a" * 32
+        Path(self.config["sshPublicKey"]).write_text("ssh-ed25519 " + base64.b64encode(wire).decode())
+        with patch.object(deploy, "Engine") as engine, \
+                patch.object(deploy.shutil, "which", side_effect=lambda name: "/tools/" + name
+                             if name in ("az", "tar", "openssl") else None), \
+                patch.object(deploy, "command", side_effect=AssertionError("SSH invoked")), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(deploy.main(args), 0)
+        self.assertIsNone(engine.call_args.args[1])
+        engine.return_value.deploy.assert_called_once()
+        self.assertIn("NOT_RUN", output.getvalue())
+
+    def test_managed_multichunk_transfer_is_hash_verified_and_rejects_changed_artifacts(self):
+        content = os.urandom(6000)
+        source = self.workspace / "artifact.bin"
+        source.write_bytes(content)
+        replies = []
+        def produce(name, script, marker, **kwargs):
+            arguments = script.split("python3 - ", 1)[1].split(" <<", 1)[0].split()
+            result = subprocess.run([sys.executable, str(deploy.ARTIFACT_READER), *arguments],
+                                    capture_output=True, check=True, text=True, timeout=30)
+            self.assertIn(marker, result.stdout)
+            response = {"properties": {"instanceView": {"output": result.stdout}}}
+            replies.append(response)
+            return response
+        with patch.object(self.engine, "managed", side_effect=produce) as managed:
+            self.assertEqual(self.engine.retrieve("builder", str(source),
+                                                  self.engine.evidence / "transferred"), content)
+        self.assertGreater(managed.call_count, 1)
+        changed = copy.deepcopy(replies)
+        chunk = json.loads(changed[1]["properties"]["instanceView"]["output"].splitlines()[0])
+        chunk["sha256"] = "00" * 32
+        changed[1]["properties"]["instanceView"]["output"] = json.dumps(chunk)
+        with patch.object(self.engine, "managed", side_effect=changed), \
+                self.assertRaisesRegex(deploy.DeploymentError, "changed"):
+            self.engine.retrieve("builder", "/owned/build.log", self.engine.evidence / "rejected")
+        self.assertFalse((self.engine.evidence / "rejected").exists())
+
+    def test_managed_first_reboot_acceptance_never_uses_ssh_or_claims_sdk_collection(self):
+        deploy.write_json(self.engine.evidence / "build.json", self.build)
+        deploy.private_write(self.engine.evidence / "signer.der", b"public fixture")
+        events = []
+        scripts = []
+        def managed(name, script, marker, **kwargs):
+            self.assertEqual(kwargs["role"], "reference")
+            scripts.append(script)
+            events.append(name)
+        def retrieve(role, remote, local):
+            content = json.dumps(self.acceptance(Path(local).name == "acceptance-reboot.json")).encode()
+            deploy.private_write(local, content)
+            return content
+        with patch.object(self.engine, "managed", side_effect=managed), \
+                patch.object(self.engine, "retrieve", side_effect=retrieve), \
+                patch.object(self.engine, "remove_reference_commands",
+                             side_effect=lambda: events.append("remove")), \
+                patch.object(self.engine, "az", side_effect=lambda *a, **k: events.append("restart")), \
+                patch.object(self.engine, "ssh", side_effect=AssertionError("SSH invoked")), \
+                patch.object(self.engine, "bootstrap", side_effect=AssertionError("SSH bootstrap invoked")):
+            self.engine.acceptance(self.build)
+        self.assertEqual(events, ["cvm-reference-first", "remove", "restart", "cvm-reference-reboot", "remove"])
+        self.assertIn("--previous-boot-id " + self.boot1, scripts[1])
+        summary = deploy.read_json(self.engine.evidence / "acceptance-complete.json")
+        self.assertEqual(summary["attestationCollection"], "DEFERRED_TO_SSH")
+        self.assertEqual((summary["beforeBootId"], summary["afterBootId"]), (self.boot1, self.boot2))
+        self.assertFalse((self.engine.evidence / "attestation").exists())
+        with patch.object(deploy, "public_profile", return_value={}), \
+                patch.object(deploy, "validate_gallery"), patch.object(self.engine, "rest", return_value={}), \
+                patch.object(self.engine, "validate_attestation_files", side_effect=AssertionError("SDK gate invoked")):
+            self.engine.acceptance_gate()
+            summary["attestationCollection"] = "EVIDENCE_COLLECTED"
+            self.engine.record("acceptance-complete", summary)
+            with self.assertRaisesRegex(deploy.DeploymentError, "defer"):
+                self.engine.acceptance_gate()
+
+    def test_repeated_boot_id_prevents_managed_acceptance_and_retention(self):
+        deploy.write_json(self.engine.evidence / "build.json", self.build)
+        deploy.private_write(self.engine.evidence / "signer.der", b"public fixture")
+        def retrieve(role, remote, local):
+            value = self.acceptance(Path(local).name == "acceptance-reboot.json")
+            value["bootId"] = self.boot1
+            content = json.dumps(value).encode()
+            deploy.private_write(local, content)
+            return content
+        with patch.object(self.engine, "managed"), patch.object(self.engine, "retrieve", side_effect=retrieve), \
+                patch.object(self.engine, "remove_reference_commands"), patch.object(self.engine, "az"), \
+                self.assertRaises(deploy.DeploymentError):
+            self.engine.acceptance(self.build)
+        self.assertFalse((self.engine.evidence / "acceptance-complete.json").exists())
+
+    def test_reference_managed_commands_are_removed_without_deleting_unrelated_commands(self):
+        owned = dict(self.model(), id=self.model()["id"] + "/runCommands/cvm-reference-first")
+        unrelated = dict(owned, id=owned["id"] + "-other", tags={})
+        with patch.object(self.engine, "owned_group"), patch.object(self.engine, "vm"), \
+                patch.object(self.engine, "az", side_effect=[[owned, unrelated], [unrelated]]), \
+                patch.object(self.engine, "rest") as rest:
+            self.engine.remove_reference_commands()
+        rest.assert_called_once_with("delete", owned["id"])
+
+
+class ReferenceNetworkTests(Fixture):
+    def rules(self, source="198.51.100.0/24"):
+        return [{"name": "corporate-ssh", "properties": {
+            "priority": 103, "direction": "Inbound", "access": "Allow", "protocol": "Tcp",
+            "sourceAddressPrefix": source, "sourcePortRange": "*",
+            "destinationAddressPrefix": "*", "destinationPortRange": "22",
+        }}]
+
+    def test_template_rejects_unrestricted_ssh_and_nonportable_security_groups(self):
+        for source in ("*", "Internet", "0.0.0.0/0", "::/0"):
+            with self.subTest(source=source), self.assertRaisesRegex(deploy.DeploymentError, "unrestricted"):
+                deploy.network_rules({"properties": {"securityRules": self.rules(source)}})
+        rules = self.rules()
+        rules[0]["properties"]["sourceApplicationSecurityGroups"] = [{"id": "/unrelated/asg"}]
+        with self.assertRaisesRegex(deploy.DeploymentError, "not portable"):
+            deploy.network_rules({"properties": {"securityRules": rules}})
+
+    def test_corporate_public_endpoint_copies_both_nsgs_only_after_deallocation(self):
+        self.config["referenceNetworkTemplateNicId"] = (
+            "/subscriptions/" + self.config["subscriptionId"]
+            + "/resourceGroups/approved/providers/Microsoft.Network/networkInterfaces/reference")
+        self.engine.record("reference-network-template", {
+            "sourceNicId": self.config["referenceNetworkTemplateNicId"],
+            "nicRules": self.rules(), "subnetRules": self.rules(),
+        })
+        base = deploy.base_id(self.config) + "/providers/Microsoft.Network/"
+        subnet = base + "virtualNetworks/v/subnets/cvm"
+        self.engine.record("subnet", {"id": subnet})
+        nic = dict(self.model(), id=base + "networkInterfaces/" + self.config["referenceVm"] + "-nic",
+                   name=self.config["referenceVm"] + "-nic",
+                   ipConfigurations=[{"name": "ipconfig1", "subnet": {"id": subnet}}])
+        model = dict(self.model(), networkProfile={"networkInterfaces": [{"id": nic["id"]}]})
+        public = dict(self.model(), id=base + "publicIPAddresses/" + self.config["referenceVm"] + "-ssh",
+                      ipAddress="203.0.113.24", sku={"name": "Standard", "tier": "Regional"},
+                      publicIPAllocationMethod="Static", publicIPAddressVersion="IPv4")
+        nsgs = {base + "networkSecurityGroups/" + self.config["networkSecurityGroup"]: {
+            "id": base + "networkSecurityGroups/" + self.config["networkSecurityGroup"],
+            "tags": dict(self.model()["tags"], role="network"),
+            "properties": {"securityRules": [], "provisioningState": "Succeeded"},
+        }}
+        puts = []
+        def rest(method, ident, body=None, **kwargs):
+            if method == "put":
+                puts.append(ident)
+                nsgs[ident] = dict(copy.deepcopy(body), id=ident)
+                nsgs[ident]["properties"]["provisioningState"] = "Succeeded"
+            return nsgs[ident]
+        def azure(*args):
+            if args[:2] == ("vm", "get-instance-view"):
+                return {"instanceView": {"statuses": [{"code": "PowerState/deallocated"}]}}
+            if args[:2] == ("resource", "list"):
+                return []
+            if args[:4] == ("network", "vnet", "subnet", "show"):
+                return {"networkSecurityGroup": {
+                    "id": base + "networkSecurityGroups/" + self.config["networkSecurityGroup"]}}
+            if args[:3] == ("network", "nic", "show"):
+                return copy.deepcopy(nic)
+            if args[:3] == ("network", "nic", "update"):
+                nic["networkSecurityGroup"] = {"id": args[-1]}
+            elif args[:3] == ("network", "public-ip", "show"):
+                return public
+            elif args[:4] == ("network", "nic", "ip-config", "update"):
+                nic["ipConfigurations"][0]["publicIPAddress"] = {"id": public["id"]}
+            elif args[:3] != ("network", "public-ip", "create"):
+                self.fail("Unexpected Azure call")
+        with patch.object(self.engine, "owned_group"), patch.object(self.engine, "vm", return_value=model), \
+                patch.object(self.engine, "check_reference_model"), patch.object(self.engine, "rest", side_effect=rest), \
+                patch.object(self.engine, "az", side_effect=azure):
+            self.engine.enable_reference_ssh()
+        self.assertEqual(len(puts), 2)
+        self.assertTrue(all(ident.startswith(deploy.base_id(self.config) + "/") for ident in puts))
+        self.assertEqual(deploy.read_json(self.engine.evidence / "reference-ssh.json")["address"], "203.0.113.24")
+        with patch.object(self.engine, "owned_group"), patch.object(self.engine, "vm", return_value=model), \
+                patch.object(self.engine, "check_reference_model"), patch.object(self.engine, "az", return_value={
+                    "instanceView": {"statuses": [{"code": "PowerState/running"}]}}), \
+                patch.object(self.engine, "rest") as request, \
+                self.assertRaisesRegex(deploy.DeploymentError, "deallocated"):
+            self.engine.enable_reference_ssh()
+        request.assert_not_called()
 
 
 class EvidenceTests(Fixture):

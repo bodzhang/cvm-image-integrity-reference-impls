@@ -60,23 +60,29 @@ Never run image mounts/builds on a shared or production host.
 
 ## Prerequisites for automatic deployment
 
-- Python 3, Azure CLI, OpenSSH client tools, OpenSSL and `tar` on the controller.
+- Python 3, Azure CLI, OpenSSL and `tar` on the controller.
   Windows additionally requires PowerShell 7; Linux does not require PowerShell.
+  The optional SSH-validation mode also needs OpenSSH client tools.
 - `az login` using your organization's permitted authentication flow.
 - An existing OpenSSH keypair. Supply only the public key for provisioning;
-  the private key stays on the controller and authenticates SSH.
+  the private key stays on your client for later SSH. Default managed acceptance
+  does not need the private key.
 - A new dedicated resource group and a new private run directory outside the
   checkout. Protect Windows evidence using a private user directory/appropriate
   ACLs; tokens and raw VM evidence must not be shared or committed.
 - Permission/quota for the builder and selected CVM, disks, networking,
   Gallery, private upload storage and container-scoped role assignments.
-- An approved network path from the controller to builder/reference SSH.
+- Default basic acceptance and build-artifact retrieval use Azure Managed Run
+  Command, so no inbound route, jump host or peering is required.
+- Optional `--validation-transport ssh` requires an approved network path from
+  the controller to builder/reference SSH.
   Supply the approved RFC1918 source with `--ssh-source-cidr` /
   `-SshSourceCidr`; the VMs have private addresses only. The controller creates
   an outbound NAT gateway, not inbound public VM addresses or Internet SSH
-  rules. Organization policy and existing private routing must permit access
+  rules during validation. Organization policy and existing private routing must permit access
   to the new subnet; the controller does not establish hub peering or VPNs.
-- An explicit approved MAA `AzureGuest` endpoint. The controller does not
+- An explicit approved MAA `AzureGuest` endpoint for optional SSH-mode SDK
+  collection or later manual SDK runs. The controller does not
   create a provider or weaken its policy. Default policies may reject custom
   firmware signers; see the [custom-db qualification details](LOCAL-BUILD.md#dedicated-custom-db-test-endpoint).
 - Approved guest outbound access to package repositories, Rust distribution,
@@ -95,9 +101,6 @@ Preview first:
 bash deploy.sh --subscription-id '<your-subscription-guid>' \
   --resource-group rg-my-dracut --prefix mydracut \
   --ssh-public-key "$HOME/.ssh/id_ed25519.pub" \
-  --ssh-private-key "$HOME/.ssh/id_ed25519" \
-  --ssh-source-cidr '<approved-corporate-RFC1918-CIDR>' \
-  --maa-endpoint 'https://<your-approved-provider>.attest.azure.net' \
   --location westus3 --plan
 ```
 
@@ -108,7 +111,39 @@ select a non-overlapping private network compatible with your approved routing.
 Existing resource groups and
 run directories are rejected; failed runs are not silently resumed.
 
-If the approved private route is through an existing SSH jump host, add:
+Default `--validation-transport managed` verifies first boot and a real reboot
+through Managed Run Command. Installed collector hashes/provenance are checked,
+but the SDK is **not run** and no MAA token is collected; the result records
+`NOT_RUN` / `DEFERRED_TO_SSH`. After success, the reference remains deallocated.
+
+To retain a corporate-accessible SSH endpoint after successful acceptance, add:
+
+```bash
+  --reference-network-template-nic-id \
+    '/subscriptions/<your-subscription-guid>/resourceGroups/<approved-group>/providers/Microsoft.Network/networkInterfaces/<approved-reference-NIC>'
+```
+
+This is explicit approval to copy that NIC's **configured NIC and subnet NSG
+rules**, including corporate source tags/CIDRs. It does not copy its IP address,
+reuse or modify its resources, or expand service tags into hard-coded IP lists.
+The source must have a static Standard IPv4 public IP and both NSGs.
+Unrestricted Internet SSH and application-security-group references are rejected.
+Both rule sets are captured privately and their copies are read back exactly.
+Only after acceptance, builder deletion and reference deallocation are the
+copied rules applied to the new run's subnet/reference NSGs and a new static
+public IP attached to the reference NIC. The builder never receives a public IP.
+Without this option, the reference remains private-only.
+
+Start the retained reference when needed, authenticate its current host key
+through Azure boot diagnostics, then use your private login key to SSH and run
+the installed collector. The endpoint and host-key instructions are recorded in
+private `evidence/reference-ssh.json`. Each reboot regenerates the host key.
+
+To preserve the earlier end-to-end SSH acceptance/SDK-collection workflow,
+select `--validation-transport ssh` and supply `--ssh-private-key`,
+`--ssh-source-cidr` and `--maa-endpoint`. That mode still requires private routing
+during acceptance; post-test public SSH does not establish that route.
+If the approved private route is through an existing SSH jump host, also add:
 
 ```bash
   --ssh-jump-host '<jump-user>@<approved-jump-address>' \
@@ -128,14 +163,14 @@ create peering or change an existing jump host's ingress rules.
 .\Deploy.ps1 -SubscriptionId '<your-subscription-guid>' `
   -ResourceGroup 'rg-my-dracut' -Prefix 'mydracut' `
   -SshPublicKey "$HOME\.ssh\id_ed25519.pub" `
-  -SshPrivateKey "$HOME\.ssh\id_ed25519" `
-  -SshSourceCidr '<approved-corporate-RFC1918-CIDR>' `
-  -MaaEndpoint 'https://<your-approved-provider>.attest.azure.net' `
   -Location westus3 -Plan
 ```
 
 Remove `-Plan` to execute. The PowerShell entry point requires the same Python
 engine, not Git Bash, and has the same lifecycle and validation boundaries.
+`-ValidationTransport managed` is the default; `-ReferenceNetworkTemplateNicId`
+selects the same opt-in corporate SSH template. `-ValidationTransport ssh`
+requires `-SshPrivateKey`, `-SshSourceCidr` and `-MaaEndpoint`.
 `-NetworkAddressPrefix`, `-SubnetPrefix` and `-BuilderImage` match the corresponding
 Bash options. `-SshJumpHost` and `-SshJumpKnownHosts` provide the same opt-in
 authenticated jump path. Plan still validates CIDR syntax, so replace the example
@@ -157,19 +192,27 @@ placeholders even when previewing.
    completed Gallery replication and exact signer/template readback.
 7. Launch a `ConfidentialVM` with Secure Boot, vTPM and `VMGuestStateOnly`;
    verify its actual Azure security/image model.
-8. Authenticate the SSH host key through Azure boot diagnostics. Stage the
-   verifier and independent inputs; check firmware signer, kernel, live
-   verity/hash/devices, full lower verification, tmpfs, agents/cloud-init and
-   installed collector provenance.
-9. Create the measured volatile workload, reboot, authenticate the regenerated
-   host key, and require a distinct boot ID plus loss of the complete workload.
-10. Run the **installed** collector over SSH using a fresh controller challenge
-    and the explicit MAA endpoint. Retrieve private evidence with hash checks;
-    retain explicit PCR12 coverage-gap reporting.
+8. Stage the independent inputs and verifier through Managed Run Command. Check
+   firmware signer, kernel, live verity/hash/devices, full lower verification,
+   tmpfs, agents/cloud-init and installed collector provenance.
+9. Create the measured volatile workload, remove owned test commands, reboot
+   through Azure and restage the verifier. Require a distinct boot ID plus loss
+   of the complete workload. Retrieve JSON using compressed chunks with SHA256
+   checks rather than relying on truncated command output.
+10. Leave SDK execution to authenticated SSH after start (`NOT_RUN`), or in
+    optional SSH-validation mode perform the installed-collector MAA collection.
 11. Remove ownership-checked temporary build/upload resources and retain the
     Gallery image plus the **deallocated** reference CVM and local evidence.
+    Apply an explicitly selected corporate SSH network template only afterward.
 
-First/reboot validation does not use managed Run Command or SDK overrides.
+In optional SSH-validation mode, authenticate the SSH host key through Azure
+boot diagnostics. Stage the verifier and independent inputs; check firmware
+signer, kernel, live verity/hash/devices, full lower verification, tmpfs,
+agents/cloud-init and installed collector provenance.
+Then authenticate the regenerated host key after reboot and collect from the
+installed SDK with a fresh controller challenge and approved MAA endpoint;
+retain explicit PCR12 coverage-gap reporting. No SDK override is used.
+
 No path disables Secure Boot, bypasses verity or changes centralized policy.
 `VMGuestStateOnly` persists encrypted guest firmware/TPM state; it does not
 request OS-disk encryption or an ephemeral OS disk.
@@ -195,6 +238,11 @@ Local controller tests mock Azure/SSH. Neither passing mocks nor the earlier
 manual Gallery 1.0.4 run demonstrates the new automatic controller end to end.
 Real userspace/SDK tests and actual manual Azure results are distinguished in
 [VALIDATION.md](VALIDATION.md).
+
+Managed artifact retrieval reuses the legacy
+[compressed chunk reader](../verity-tmpfs-root/scripts/Read-ArtifactChunk.py);
+keep the full repository checkout available. This does not select the legacy
+image producer or Canonical boot integration.
 
 Keep configuration, independently retained build inputs, signer/readback,
 first/reboot JSON, stderr, requested challenge and attestation evidence outside
