@@ -1,6 +1,20 @@
 # Validation scope
 
-[Recipe](README.md) | [Repository index](../../README.md)
+[Recipe](README.md) | [Manual workflow](LOCAL-BUILD.md) | [Repository index](../../README.md)
+
+## Deployment entry-point qualification
+
+The Bash and PowerShell entry points share a Python deployment/cleanup engine.
+Local tests exercise configuration/plan guards, failure handling, resource
+ownership, publication and SSH evidence checks without Azure resources.
+The shared engine's 40 tests passed under both Linux and native Windows Python,
+including real RSA certificate-profile checks with OpenSSL; no tests were
+skipped. Bash argument/failure propagation and actual Windows PowerShell
+plan/network-option/failure handling checks passed. The existing 29
+recipe, attestation and guest-validation regressions also passed.
+They do not establish that the new automatic controller has completed a real
+deployment. The Gallery 1.0.4 results below were obtained through the manual
+workflow; do not relabel them as controller acceptance.
 
 ## Evidence levels
 

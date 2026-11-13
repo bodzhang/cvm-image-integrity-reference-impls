@@ -22,7 +22,7 @@ protection, or immutable effective-root executables.
 ```text
 ubuntu/
   verity-tmpfs-root/       # Canonical controllers, guest scripts and tests
-  dracut-verity-tmpfs-root/ # Independent Ubuntu 24.04 offline build and checks
+  dracut-verity-tmpfs-root/ # Ubuntu 24.04 Dracut build, controllers and SSH checks
 azure-linux/
   verity-tmpfs-root/       # IC YAML, pinned build recipe and guest checks
 ```
@@ -37,8 +37,12 @@ for you**, then deploy a separate reference CVM. Running the Bash controller on
 Linux does not build on that machine. Users with an existing Linux environment
 can instead follow the [manual local-builder workflow](ubuntu/verity-tmpfs-root/LOCAL-BUILD.md),
 which builds locally and uses just one Azure target VM for acceptance.
-The separate Ubuntu 24.04 Dracut recipe has an offline build entry point,
-not an Azure resource controller.
+The Ubuntu 24.04 Dracut recipe now offers Bash/PowerShell entry points over a
+shared Python controller, as well as an independent
+[manual Linux workflow](ubuntu/dracut-verity-tmpfs-root/LOCAL-BUILD.md).
+Its controllers preserve the distinct Dracut/systemd signed-hash boot chain and
+use authenticated SSH for first/reboot and installed-collector checks. Their
+local/mock validation is separate from the demonstrated manual Azure flow.
 
 Keep run directories, image artifacts, credentials and raw guest evidence
 outside this checkout. Each configuration documents its own resource creation,
