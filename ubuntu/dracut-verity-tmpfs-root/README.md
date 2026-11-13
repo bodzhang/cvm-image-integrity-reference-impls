@@ -366,7 +366,10 @@ That example is for Windows. Our actual Linux/TDX token additionally contains
 `x-ms-azurevm-attested-pcr-values`, mapping names such as `pcr7` and `pcr11` to
 base64 SHA-256 values. Its signature was verified and its reported values
 matched the submitted evidence. The diagnostic requested `0-8,11,12`, but
-the token covers only `0-8,11`: PCR 12 must not be claimed as attested.
+the token covers only `0-8,11`: **PCR 12 is a known MAA token-coverage gap**,
+not a reason to remove it from the required expanded request. Its coverage and
+raw value are absent from the tested token, so PCR 12 must not be claimed as
+attested. See [the explicit gap and limits](VALIDATION.md#known-gap-maa-does-not-return-pcr-12-in-the-tested-token).
 Do not assume arbitrary custom claim emission or a particular provider policy.
 
 An independent relying party must:

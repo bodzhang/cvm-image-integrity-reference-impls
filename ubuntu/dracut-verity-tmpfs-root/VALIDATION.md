@@ -172,10 +172,20 @@ The signed token reports:
 - `x-ms-azurevm-attested-pcr-values` contains raw base64 SHA-256 digests for
   those PCRs, including PCR 7 and PCR 11; all match the submitted request.
 
+### Known gap: MAA does not return PCR 12 in the tested token
+
 PCR 12 is present in the submitted PCR set and values, with an all-zero digest,
 but is **absent from the signed coverage/value claims**. Do not claim complete
 coverage of the requested set or infer that a zero PCR alone explains omission:
 the token includes PCR 8 with a zero value.
+
+Keep PCR 12 in the required expanded request `0-8,11,12`; do not remove it to
+hide the gap. Until the provider returns both its signed coverage and value,
+a relying party cannot verify PCR 12 from this token alone. The cause remains
+unestablished; this observed gap is not a claim that every MAA configuration
+omits PCR 12.
+
+### Verified evidence and remaining limits
 
 The signed PCR 11 value matches the independently replayed genuine measurements
 above. The submitted event-log SHA-256 matches the diagnostic's exact normalized
