@@ -8,14 +8,33 @@ export PATH="$CARGO_HOME/bin:$PATH"
 work=/var/lib/cvm-dracut
 recipe=/opt/cvm-dracut/checkout/ubuntu/dracut-verity-tmpfs-root
 fail() { echo "DRACUT_DEPLOYMENT_BUILD_FAILED: $*" >&2; exit 1; }
+update_package_indexes() {
+    local deadline=$((SECONDS + 300)) result
+    while true; do
+        if LC_ALL=C apt-get -o APT::Update::Error-Mode=any update 2>"$work/apt-update.stderr"; then
+            cat "$work/apt-update.stderr" >&2
+            return 0
+        else
+            result=$?
+        fi
+        cat "$work/apt-update.stderr" >&2
+        if [[ "$result" != 100 ]] ||
+            ! grep -q '^E: Could not get lock /var/lib/apt/lists/lock\.' "$work/apt-update.stderr" ||
+            (( SECONDS >= deadline )); then
+            return "$result"
+        fi
+        echo 'Waiting for the builder package-index lock' >&2
+        sleep 5
+    done
+}
 test "$(id -u)" = 0 || fail 'Builder requires root'
 case "${1:-}" in
 provision)
     test "$(dpkg --print-architecture)" = amd64 || fail 'Expected an x64 builder'
     . /etc/os-release
     test "$ID" = ubuntu && test "$VERSION_ID" = 24.04 || fail 'Expected Ubuntu 24.04'
-    apt-get -o APT::Update::Error-Mode=any update
-    apt-get install -y --no-install-recommends \
+    update_package_indexes
+    apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends \
         build-essential git python3 binutils openssl sbsigntool systemd-ukify qemu-utils \
         rsync gdisk dosfstools e2fsprogs cryptsetup-bin util-linux udev kmod ca-certificates curl
     # Pin rustup itself and verify the official HTTPS-distributed binary before
@@ -154,7 +173,7 @@ record = {
     "sourceKernels": json.loads((work / "source-kernels.json").read_text()),
     "rustupBinarySha256": sha(work / "rustup-init"),
     "privateSigner": "RSA3072; mode0600; remains exclusively on this builder",
-    "validation": "Recipe completed all offline checks; no Azure guest acceptance claimed",
+    "validation": "Default build checks passed; full-disk/corruption qualification not run; Azure guest acceptance required",
 }
 (work / "provenance.json").write_text(json.dumps(record, indent=2) + "\n")
 PY

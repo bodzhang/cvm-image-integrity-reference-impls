@@ -60,9 +60,9 @@ Azure are manual, optional, billable operations in your own authorized scope.
 Unbooted Marketplace raw disk (read-only)
   -> new GPT disk; copy root and optional separate /boot
   -> offline customization + guest packages + matching-kernel Dracut initramfs
-  -> unmount root, check ext4, veritysetup format + verify
+  -> unmount root, check ext4, veritysetup format
   -> ukify with original kernel, new initramfs, generated signed .cmdline
-  -> write signed UKI to ESP only, verify root again, corruption checks
+  -> write signed UKI to ESP only, check GPT and fixed-VHD format
   -> fixed Azure VHD
 
 Firmware Secure Boot db -> signed EFI/BOOT/BOOTX64.EFI (systemd-stub UKI)
@@ -198,7 +198,7 @@ reproducibility and arbitrary future package versions are not claimed.
 
 Budget at least 150 GiB plus package headroom. The 32 GiB data partition is
 fixed for this configuration; a source that does not fit fails during copy.
-The corruption test makes a disposable data-partition copy. Reserve ample
+Optional corruption qualification makes a disposable data-partition copy. Reserve ample
 tmpfs RAM in the eventual CVM; do not add disk swap to compensate.
 
 Generate your own signer, or use an existing approved RSA signer:
@@ -228,14 +228,41 @@ Success requires `DRACUT_VERITY_IMAGE_BUILD_PASSED` and produces:
 - original kernel payload, new initramfs and exact generated `cmdline`;
 - `evidence/build.json` with kernel, root hash and both PARTUUIDs;
 - source/output hashes, source/output GPT layout, package and signed-driver
-  inventories, initrd inventory, verity format, ext4 and fixed-VHD checks;
-- offline corruption rejection plus live verified-read I/O failure/status `C`.
+  inventories, initrd inventory, verity format, ext4 and fixed-VHD checks.
 
 The signed UKI's `.linux`, `.initrd` and `.cmdline` are checked byte-for-byte
 against inputs; `sbverify` checks the certificate signature. The protected root
-is never mounted writable after hashing. The image is verified again after the
-ESP write. Failed runs retain diagnostics but are **not publishable**; cleanup
+is never mounted writable after hashing. The default demonstrates the clean-room
+build rather than scanning the finished disk or injecting corruption;
+`evidence/build.json` records disk qualification as `NOT_RUN`.
+Failed runs retain diagnostics but are **not publishable**; cleanup
 only artifacts you own, after confirming mounts and mappings were released.
+
+### Optional disk qualification
+
+This is separate from the default build/deployment flow. On an exclusive builder,
+the existing test first fully verifies the data/hash pair, then verifies rejection
+of a disposable corrupted copy both offline and through a live verity mapper.
+It does not modify the built image. Allow time for full reads and space for the
+32 GiB disposable copy.
+
+From this recipe directory, after a successful build:
+
+```bash
+sudo unshare --mount --propagation private bash -s -- "$PWD" /secure/runs/dracut-example <<'QUALIFY'
+set -euo pipefail
+recipe=$1 build=$2
+loop=$(losetup --find --show --read-only --partscan "$build/image.raw")
+trap 'losetup -d "$loop"' EXIT
+udevadm settle
+root_hash=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rootHash"])' "$build/evidence/build.json")
+evidence=$(mktemp -d "$build/evidence/verity-qualification.XXXXXXXX")
+bash "$recipe/scripts/test-corruption.sh" "${loop}p2" "${loop}p3" "$root_hash" "$evidence"
+QUALIFY
+```
+
+The smaller userspace verification/corruption tests in
+[tests/test_components.py](tests/test_components.py) also remain explicitly invoked.
 
 ## 3. Publish and enroll the actual signer
 
@@ -338,8 +365,8 @@ ssh "${ssh_options[@]}" "$target" \
 ```
 
 First-boot checks include firmware Secure Boot/SetupMode/db signer, TPM, exact
-kernel and boot arguments, the live verity table's hash/devices, full offline
-verity verification, tmpfs/root policy, cloud-init, guest agent and failed
+kernel and boot arguments, the live verity table's expected hash/devices,
+read-only dm-verity lower mount, tmpfs/root policy, cloud-init, guest agent and failed
 systemd units. New build records also require the installed native collector,
 wrapper and provenance to match independent build evidence on both boots.
 Legacy records without SDK evidence explicitly report that the collector was

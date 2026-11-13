@@ -2,7 +2,7 @@
 """Private-network Azure controller for the Dracut recipe (stdlib only).
 
 Azure authorization and authenticated SSH are separate trust boundaries. Managed
-Run Command is used only on the disposable builder, never for guest acceptance.
+Run Command provides basic acceptance; optional SSH mode also collects SDK evidence.
 """
 
 import argparse
@@ -208,7 +208,7 @@ def azure_executable():
 def azure_body_path(path):
     launcher = Path(shutil.which("az") or "az")
     if os.name != "nt" and (launcher.parent.parent / "python.exe").is_file():
-        require(shutil.which("wslpath"), "WSL Windows Azure CLI requires wslpath for large request files")
+        require(shutil.which("wslpath"), "WSL Windows Azure CLI requires wslpath for request files")
         return command(["wslpath", "-w", str(path)]).stdout.decode().strip()
     return str(path)
 
@@ -402,12 +402,10 @@ class Engine:
             args += ["--url-parameters", "$expand=" + expand]
         if body is not None:
             payload = json.dumps(body, separators=(",", ":"))
-            # Recipe staging exceeds native Windows/WSL command-line limits.
-            if len(payload.encode()) > 8192:
-                path = self.evidence / ("azure-request-" + uuid.uuid4().hex + ".json")
-                private_write(path, payload)
-                payload = "@" + azure_body_path(path)
-            args += ["--body", payload,
+            # Files avoid native argument limits and inline JSON escape loss.
+            path = self.evidence / ("azure-request-" + uuid.uuid4().hex + ".json")
+            private_write(path, payload)
+            args += ["--body", "@" + azure_body_path(path),
                      "--headers", "Content-Type=application/json"]
         return self.az(*args)
 
@@ -573,11 +571,16 @@ class Engine:
 
     def managed(self, name, script, marker, timeout=7200, *, role="builder"):
         require(role in ("builder", "reference"), "Invalid managed-command VM role")
-        self.owned_group()
+        group = self.owned_group()
         self.vm(role)
         ident = (base_id(self.c) + "/providers/Microsoft.Compute/virtualMachines/"
                  + self.c[role + "Vm"] + "/runCommands/" + name)
-        body = {"location": self.c["location"], "tags": dict(item.split("=", 1) for item in self.tags(role)),
+        tags = dict(item.split("=", 1) for item in self.tags(role))
+        # Match the legacy controller: avoid a policy tag repair rewriting the command.
+        modified_by = (group.get("tags") or {}).get("ModifiedBy")
+        if modified_by:
+            tags["ModifiedBy"] = modified_by
+        body = {"location": self.c["location"], "tags": tags,
                 "properties": {"source": {"script": script}, "asyncExecution": True,
                                "timeoutInSeconds": timeout}}
         self.rest("put", ident, body)

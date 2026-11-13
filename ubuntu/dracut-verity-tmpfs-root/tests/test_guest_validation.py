@@ -78,5 +78,47 @@ class CollectorTests(unittest.TestCase):
                 target.write_bytes(original)
 
 
+class VerityMountTests(unittest.TestCase):
+    def setUp(self):
+        self.expected = {
+            "rootHash": "ab" * 32,
+            "dataPartUuid": "10000000-0000-0000-0000-000000000001",
+            "hashPartUuid": "10000000-0000-0000-0000-000000000002",
+        }
+        self.table = ("0 67108864 verity 1 8:2 8:3 4096 4096 8388608 1 sha256 "
+                      + self.expected["rootHash"] + " cd").split()
+        numbers = {"8:2": (8, 2), "8:3": (8, 3), "8:4": (8, 4),
+                   "/dev/disk/by-partuuid/" + self.expected["dataPartUuid"]: (8, 2),
+                   "/dev/disk/by-partuuid/" + self.expected["hashPartUuid"]: (8, 3)}
+        self.devices = patch.object(guest, "device_number", side_effect=numbers.__getitem__)
+        self.devices.start()
+        self.addCleanup(self.devices.stop)
+
+    def test_confirms_live_mount_without_scanning_disk_content(self):
+        def policy(args, **kwargs):
+            self.assertEqual(args, ["/usr/local/libexec/cvm-check-root", "/"])
+            self.assertTrue(kwargs["check"])
+            return subprocess.CompletedProcess(args, 0)
+
+        with patch.object(guest, "run", return_value=" ".join(self.table)) as query, \
+                patch.object(guest.subprocess, "run", side_effect=policy) as command:
+            guest.verify_verity_mount(self.expected)
+        query.assert_called_once_with("dmsetup", "table", "root")
+        command.assert_called_once()
+
+    def test_rejects_wrong_mapper_hash_or_devices_and_failed_mount_policy(self):
+        for index, value in ((2, "linear"), (10, "sha512"), (11, "ff" * 32),
+                             (4, "8:4"), (5, "8:4")):
+            table = self.table.copy()
+            table[index] = value
+            with self.subTest(index=index), patch.object(guest, "run", return_value=" ".join(table)), \
+                    patch.object(guest.subprocess, "run"), self.assertRaises(RuntimeError):
+                guest.verify_verity_mount(self.expected)
+        with patch.object(guest.subprocess, "run", side_effect=subprocess.CalledProcessError(
+                1, ["/usr/local/libexec/cvm-check-root", "/"])), \
+                self.assertRaises(subprocess.CalledProcessError):
+            guest.verify_verity_mount(self.expected)
+
+
 if __name__ == "__main__":
     unittest.main()

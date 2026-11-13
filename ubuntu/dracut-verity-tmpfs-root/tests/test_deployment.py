@@ -229,18 +229,20 @@ class AzureBoundaryTests(Fixture):
                              expand="ReplicationStatus,UefiSettings")
         args = process.call_args.args[0]
         self.assertEqual(args[:4], [str(Path("C:/Azure CLI/CLI2/python.exe")), "-IBm", "azure.cli", "rest"])
-        self.assertEqual(json.loads(args[args.index("--body") + 1]), body)
+        self.assertEqual(json.loads(Path(args[args.index("--body") + 1][1:]).read_text()), body)
         self.assertEqual(args[args.index("--url-parameters") + 1], "$expand=ReplicationStatus,UefiSettings")
         self.assertFalse(any(arg.lower().endswith((".cmd", ".bat")) for arg in args))
         self.assertFalse(process.call_args.kwargs.get("shell", False))
 
-    def test_rest_uses_inline_json_and_explicit_subscription_without_credential_flags(self):
-        body = {"properties": {"source": {"script": "echo 'path with spaces' \"quoted\""}}}
-        with patch.object(deploy.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"{}", b"")) as run:
+    def test_small_rest_script_uses_file_and_explicit_subscription_without_credential_flags(self):
+        body = {"properties": {"source": {"script": "echo 'path with spaces' \"quoted\"\nprintf '%s\\n' done\n"}}}
+        with patch.object(deploy.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"{}", b"")) as run, \
+                patch.object(deploy, "azure_body_path", side_effect=str):
             self.engine.rest("put", deploy.base_id(self.config) + "/a/b", body)
         args = run.call_args.args[0]
-        self.assertEqual(json.loads(args[args.index("--body") + 1]), body)
-        self.assertFalse(args[args.index("--body") + 1].startswith("@"))
+        argument = args[args.index("--body") + 1]
+        self.assertTrue(argument.startswith("@"))
+        self.assertEqual(json.loads(Path(argument[1:]).read_text()), body)
         self.assertEqual(args[args.index("--subscription") + 1], self.config["subscriptionId"])
         self.assertNotIn("account", args)
         self.assertNotIn("--sas-token", args)
@@ -315,11 +317,26 @@ class AzureBoundaryTests(Fixture):
             response = {"properties": {"instanceView": {
                 "executionState": state, "exitCode": exit_code, "output": output}}}
             with self.subTest(exit=exit_code, state=state), \
-                    patch.object(self.engine, "owned_group"), patch.object(self.engine, "vm") as vm, \
+                    patch.object(self.engine, "owned_group", return_value={"tags": {}}), \
+                    patch.object(self.engine, "vm") as vm, \
                     patch.object(self.engine, "rest", side_effect=[{}, response]), \
                     self.assertRaises(deploy.DeploymentError):
                 self.engine.managed("test", "echo PASSED", "PASSED")
             vm.assert_called_once_with("builder")
+
+    def test_managed_command_preserves_policy_tag_without_inheriting_other_group_tags(self):
+        response = {"properties": {"instanceView": {
+            "executionState": "Succeeded", "exitCode": 0, "output": "PASSED"}}}
+        for policy in ({}, {"ModifiedBy": "policy-fixture"}):
+            with self.subTest(policy=policy), \
+                    patch.object(self.engine, "owned_group", return_value={
+                        "tags": dict(policy, role="run", unrelated="not-inherited")}), \
+                    patch.object(self.engine, "vm"), \
+                    patch.object(self.engine, "rest", side_effect=[{}, response]) as rest:
+                self.engine.managed("test", "echo PASSED", "PASSED")
+            tags = rest.call_args_list[0].args[2]["tags"]
+            self.assertEqual(tags, dict(policy, purpose=deploy.PURPOSE,
+                                        runId=self.config["runId"], role="builder"))
 
     def test_zonal_restrictions_do_not_block_non_zonal_vms_but_location_restrictions_do(self):
         for kind, accepted in (("Zone", True), ("Location", False)):

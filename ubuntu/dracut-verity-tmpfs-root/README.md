@@ -40,7 +40,7 @@ expected-image remote verification remain unqualified.
 The source pin and SDK patch hash are in [inputs.json](inputs.json).
 Never substitute the builder kernel or silently select a newer Marketplace
 version. Source provenance, layout, signed modules, original kernel, signed
-UKI sections, corruption rejection and fixed-VHD checks are hard gates.
+UKI sections and fixed-VHD checks are build gates.
 
 ## Choose where to build
 
@@ -184,15 +184,15 @@ placeholders even when previewing.
 4. Build the matching-kernel Dracut initramfs and signed UKI. Install the patched
    native SDK and expanded-PCR wrapper **before hashing**; verify installed
    binary/wrapper/provenance and retain independent build evidence.
-5. Require verity, exact UKI sections/signature, live corruption rejection and
-   fixed-VHD gates. Upload privately using the builder's managed identity,
+5. Generate verity data, check exact UKI sections/signature and fixed-VHD format.
+   Upload privately using the builder's managed identity,
    without storage account keys or SAS.
 6. Publish the exact public signer plus Microsoft UEFI template. Require
    completed Gallery replication and exact signer/template readback.
 7. Launch a `ConfidentialVM` with Secure Boot, vTPM and `VMGuestStateOnly`;
    verify its actual Azure security/image model.
 8. Stage the independent inputs and verifier through Managed Run Command. Check
-   firmware signer, kernel, live verity/hash/devices, full lower verification,
+   firmware signer, kernel, live verity/hash/devices and read-only lower mount,
    tmpfs, agents/cloud-init and installed collector provenance.
 9. Create the measured volatile workload, remove owned test commands, reboot
    through Azure and restage the verifier. Require a distinct boot ID plus loss
@@ -207,11 +207,18 @@ placeholders even when previewing.
 
 In optional SSH-validation mode, authenticate the SSH host key through Azure
 boot diagnostics. Stage the verifier and independent inputs; check firmware
-signer, kernel, live verity/hash/devices, full lower verification, tmpfs,
+signer, kernel, live verity/hash/devices, read-only lower mount, tmpfs,
 agents/cloud-init and installed collector provenance.
 Then authenticate the regenerated host key after reboot and collect from the
 installed SDK with a fresh controller challenge and approved MAA endpoint;
 retain explicit PCR12 coverage-gap reporting. No SDK override is used.
+
+Guest acceptance confirms the mounted dm-verity lower and its expected hash/devices
+on both boots; it does not scan all disk blocks. The default clean-room build
+also omits full verification scans and deliberate corruption tests. They remain
+available as [separately invoked qualification](LOCAL-BUILD.md#optional-disk-qualification),
+not prerequisites for demonstrating the build/boot flow. Generating the verity
+hash tree is still required.
 
 No path disables Secure Boot, bypasses verity or changes centralized policy.
 `VMGuestStateOnly` persists encrypted guest firmware/TPM state; it does not

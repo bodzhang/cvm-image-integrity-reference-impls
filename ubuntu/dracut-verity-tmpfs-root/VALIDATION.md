@@ -7,10 +7,10 @@
 The Bash and PowerShell entry points share a Python deployment/cleanup engine.
 Local tests exercise configuration/plan guards, failure handling, resource
 ownership, publication and SSH evidence checks without Azure resources.
-The shared engine's 56 tests passed under both Linux and native Windows Python,
+The shared engine's 57 tests passed under both Linux and native Windows Python,
 including real RSA certificate-profile checks with OpenSSL; no tests were
 skipped. Bash argument/failure propagation and actual Windows PowerShell
-plan/network-option/failure handling checks passed. The existing 29
+plan/network-option/failure handling checks passed. The existing 31
 recipe, attestation and guest-validation regressions also passed.
 They do not establish that the new automatic controller has completed a real
 deployment. The Gallery 1.0.4 results below were obtained through the manual
@@ -27,6 +27,15 @@ by the VM SKU availability preflight before resource allocation. Complete
 automatic image build, publication, CVM first/reboot acceptance and cleanup
 remain unqualified.
 
+Managed live retries exposed an APT package-index lock race during provisioning
+and managed-command configurations being reset to empty. Provisioning now waits
+boundedly for package locks and preserves genuine package errors. REST bodies use
+private request files regardless of size. A live benign managed-command probe
+passed with the legacy controller's policy-tag propagation; this is not a
+successful image build or complete deployment. Focused Linux tests cover the
+package-lock behavior, and Linux/Windows tests cover request transport and
+policy-tag preservation.
+
 The default workflow now uses Managed Run Command for build-artifact retrieval
 and first/reboot basic acceptance; installed collector provenance is still
 checked, but SDK execution is explicitly deferred to SSH (`NOT_RUN`).
@@ -41,13 +50,23 @@ The earlier preflight incorrectly treated zone-only SKU restrictions as a
 regional prohibition; non-zonal requests now accept zone-only restrictions
 while continuing to reject location restrictions, with a focused regression.
 
+Guest acceptance now confirms the mounted read-only dm-verity lower, healthy
+mapper status and independently expected root hash/data/hash devices without a
+full disk scan on either boot. Two focused regressions cover query-only acceptance
+and rejection of wrong mapper/hash/devices or a failed mount policy. The default
+clean-room build also omits full verification scans and deliberate corruption
+tests; the existing qualification script and component tests remain separately
+invoked. Verity hash-tree generation, image/signature/format checks and live
+mount confirmation remain in the default flow.
+Earlier manual results below describe the previous full-scan verifier.
+
 ## Evidence levels
 
 | Surface | Scope |
 | --- | --- |
 | Marketplace catalog | Read-only Azure queries on 2026-11-12 returned the pinned non-Pro Ubuntu 24.04 CVM version in westus3, x64/Gen2 and `TrustedLaunchAndConfidentialVmSupported` |
 | Offline policy tests | 15 tests passed: generalized-source guards, writable-state finalization, pinned input, exact generated boot inputs, private mount-propagation enforcement, temporary resolver permissions/exact restoration, required switch-root dependency, volatile-service override, shared-parent setup and root-policy success/rejection paths |
-| Guest-verifier tests | 4 tests passed: completed clean cloud-init, explicit recoverable-warning reporting, fatal/incomplete/malformed-status rejection and installed collector/wrapper/provenance checks against independent build evidence |
+| Guest-verifier tests | 6 tests passed: completed clean cloud-init, explicit recoverable-warning reporting, fatal/incomplete/malformed-status rejection, installed collector/wrapper/provenance checks, query-only dm-verity mount acceptance and wrong mapper/hash/device/mount-policy rejection |
 | Real userspace tests | SHA-256 verity format/verification and corrupted-data/wrong-hash rejection; kernel-less Dracut/systemd initramfs and RSA-signed systemd-stub UKI, exact section checks and changed-command-line rejection |
 | Pinned patched attestation SDK | Exact recipe patch application and default RustCrypto release build passed: 34 event-log and 70 guest-attestation tests. Native backend passed those 104 plus 24 client regressions. Genuine retained firmware/userspace logs produced byte-identical supplementation and matched the actual CVM quote. Wrapper/build's 10 tests require `0-8,11,12`, report the PCR12 gap, check paired SDK overrides and pre-hash installation, and reject incomplete evidence/fallback without claiming remote verification |
 | Complete Marketplace conversion | **Passed on 2026-11-12** using an unbooted disk from the exact Marketplace pin on a dedicated Ubuntu 24.04 Azure builder; complete build marker includes fixed-VHD validation |
@@ -67,9 +86,10 @@ The Dracut userspace test excludes kernel modules explicitly; the real build
 requires matching signed source modules and an original kernel payload.
 
 The build's success marker is emitted only after root finalization, matching
-driver inspection, initramfs inventory checks, ext4/verity checks, signature and
-exact signed-section checks, post-ESP verity verification, disposable corruption
-offline/live-read rejection and fixed-VHD geometry/footer checks. It does not
+driver inspection, initramfs inventory checks, ext4 checks, verity generation,
+signature and exact signed-section checks and fixed-VHD geometry/footer checks.
+Full-disk verification and deliberate corruption tests are optional qualification,
+not part of the current marker. It does not
 mean firmware enrollment or Azure acceptance passed.
 
 The actual build exposed two builder-integration issues: a restrictive umask

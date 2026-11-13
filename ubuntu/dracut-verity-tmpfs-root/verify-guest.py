@@ -63,6 +63,17 @@ def verify_attestation_collector(expected, root=Path("/")):
     return sdk
 
 
+def verify_verity_mount(expected):
+    subprocess.run(["/usr/local/libexec/cvm-check-root", "/"], check=True, stdout=sys.stderr)
+    table = run("dmsetup", "table", "root").split()
+    require(len(table) >= 13 and table[2:4] == ["verity", "1"], "Unexpected verity table")
+    require(table[10] == "sha256" and table[11] == expected["rootHash"], "Live root hash differs from the UKI")
+    data = "/dev/disk/by-partuuid/" + str(uuid.UUID(expected["dataPartUuid"]))
+    hashes = "/dev/disk/by-partuuid/" + str(uuid.UUID(expected["hashPartUuid"]))
+    require(device_number(table[4]) == device_number(data), "Wrong live data device")
+    require(device_number(table[5]) == device_number(hashes), "Wrong live hash device")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("build_json", type=Path)
@@ -93,15 +104,7 @@ def main():
         "root=/dev/mapper/root", "systemd.volatile=overlay",
     ):
         require(cmdline.count(parameter) == 1, f"Missing or duplicate expected boot parameter: {parameter}")
-    subprocess.run(["/usr/local/libexec/cvm-check-root", "/"], check=True, stdout=sys.stderr)
-    table = run("dmsetup", "table", "root").split()
-    require(len(table) >= 13 and table[2:4] == ["verity", "1"], "Unexpected verity table")
-    require(table[10] == "sha256" and table[11] == expected["rootHash"], "Live root hash differs from the UKI")
-    data = "/dev/disk/by-partuuid/" + str(uuid.UUID(expected["dataPartUuid"]))
-    hashes = "/dev/disk/by-partuuid/" + str(uuid.UUID(expected["hashPartUuid"]))
-    require(device_number(table[4]) == device_number(data), "Wrong live data device")
-    require(device_number(table[5]) == device_number(hashes), "Wrong live hash device")
-    subprocess.run(["veritysetup", "verify", data, hashes, expected["rootHash"]], check=True, stdout=sys.stderr)
+    verify_verity_mount(expected)
     require(run("systemctl", "is-active", "walinuxagent.service") == "active", "Azure guest agent is not active")
     require(run("systemctl", "--failed", "--no-legend", "--plain") == "", "Failed systemd units")
     cloud_init = cloud_init_status()
