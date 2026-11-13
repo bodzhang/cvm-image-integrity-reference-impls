@@ -133,7 +133,11 @@ Never run image mounts/builds on a shared or production host.
 - An explicit approved MAA `AzureGuest` endpoint for optional SSH-mode SDK
   collection or later manual SDK runs. The controller does not
   create a provider or weaken its policy. Default policies may reject custom
-  firmware signers; see the [custom-db qualification details](LOCAL-BUILD.md#dedicated-custom-db-test-endpoint).
+  firmware signers. To create a separately owned test provider, use the opt-in
+  [Azure CLI setup helper](scripts/setup-maa-test-provider.py) and
+  [creation, policy-readback and cleanup instructions](LOCAL-BUILD.md#create-your-own-test-provider).
+  It removes only the `dbvalidated=false` denial; this is not production
+  expected-image verification.
 - Approved guest outbound access to package repositories, Rust distribution,
   GitHub, Azure management/extension endpoints, restricted upload storage and
   the approved MAA provider.

@@ -8,6 +8,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -242,6 +243,130 @@ class AttestationTests(unittest.TestCase):
             self.assertEqual(receipt["sdkBuild"]["patch"]["sha256"], "fixture")
             with patch.object(attest.os, "geteuid", return_value=0), self.assertRaisesRegex(ValueError, "both"):
                 attest.collect(ENDPOINT, NONCE, root / "other-output", sdk, None)
+
+
+class MaaSetupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "maa_setup", RECIPE / "scripts/setup-maa-test-provider.py")
+        cls.maa = importlib.util.module_from_spec(spec)
+        with patch.object(sys, "path", [str(RECIPE / "scripts"), *sys.path]):
+            spec.loader.exec_module(cls.maa)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.args = SimpleNamespace(
+            subscription_id="11111111-2222-3333-4444-555555555555",
+            resource_group="rg-maa-test", provider_name="example",
+            location="westus3", evidence_directory=str(self.root / "evidence"),
+            allow_custom_db=True)
+        self.original = ("version=1.0;\nauthorizationrules {\n"
+                         + self.maa.DB_DENIAL + "\n"
+                         + "\n".join(f'[type=="{name}", value==false] => deny();'
+                                     for name in self.maa.PRESERVED_CHECKS)
+                         + "\n};\nissuancerules {};\n")
+        self.candidate = self.original.replace(self.maa.DB_DENIAL, "", 1)
+        self.tags = None
+        self.calls = []
+
+    def response(self, policy, issuer=ENDPOINT):
+        payload = {"iss": issuer, "x-ms-policy": self.maa.policy_token(policy)}
+        return {"token": ".".join((b64(b'{"alg":"RS256"}'),
+                                   b64(json.dumps(payload).encode()), "fixture-signature"))}
+
+    def fake_azure(self, run, subscription, label, *args, body=None):
+        self.calls.append(label)
+        if label == "existing-providers":
+            return []
+        if label == "create-provider":
+            self.tags = json.loads(body)["tags"]
+            return {}
+        if label.startswith("provider-"):
+            return {"id": f"/subscriptions/{subscription}/resourceGroups/rg-maa-test/"
+                          "providers/Microsoft.Attestation/attestationProviders/example",
+                    "tags": self.tags,
+                    "properties": {"status": "Ready", "trustModel": "AAD", "attestUri": ENDPOINT}}
+        self.assertIn("--resource", args)
+        self.assertEqual(args[args.index("--resource") + 1], "https://attest.azure.net")
+        if label == "default-policy":
+            return self.response(self.original)
+        if label == "set-policy":
+            payload = self.maa.jwt_payload(body)
+            self.assertEqual(self.maa.decode(payload["AttestationPolicy"]).decode(), self.candidate)
+            return {}
+        if label == "readback-policy":
+            return self.response(self.candidate)
+        self.fail("Unexpected Azure operation: " + label)
+
+    def test_setup_preserves_default_and_publishes_only_exact_exception(self):
+        with patch.object(self.maa, "azure", side_effect=self.fake_azure):
+            result = self.maa.setup(self.args)
+        run = Path(self.args.evidence_directory)
+        self.assertEqual((run / "default-policy.txt").read_text(), self.original)
+        self.assertEqual((run / "test-policy.txt").read_text(), self.candidate)
+        self.assertEqual((run / "readback-policy.txt").read_text(), self.candidate)
+        restored = self.maa.jwt_payload((run / "default-policy.jwt").read_text())
+        self.assertEqual(self.maa.decode(restored["AttestationPolicy"]).decode(), self.original)
+        self.assertEqual((run / "endpoint.txt").read_text().strip(), ENDPOINT)
+        self.assertEqual(result["testPolicySha256"], hashlib.sha256(self.candidate.encode()).hexdigest())
+        self.assertIn("does not pin", result["verification"])
+
+    def test_existing_provider_is_never_updated(self):
+        with patch.object(self.maa, "azure", return_value=[{"name": "example"}]) as azure:
+            with self.assertRaisesRegex(self.maa.deploy.DeploymentError, "already exists"):
+                self.maa.setup(self.args)
+        self.assertEqual(azure.call_count, 1)
+        self.assertFalse((Path(self.args.evidence_directory) / "setup.json").exists())
+
+    def test_explicit_approval_is_required_before_any_azure_call(self):
+        self.args.allow_custom_db = False
+        with patch.object(self.maa, "azure") as azure:
+            with self.assertRaisesRegex(self.maa.deploy.DeploymentError, "approval"):
+                self.maa.setup(self.args)
+        azure.assert_not_called()
+
+    def test_default_policy_drift_is_rejected(self):
+        for changed in (
+            self.original.replace(self.maa.DB_DENIAL, ""),
+            self.original + self.maa.DB_DENIAL,
+            self.original.replace('[type=="secureboot", value==false] => deny();', ""),
+        ):
+            with self.subTest(policy=changed), self.assertRaises(self.maa.deploy.DeploymentError):
+                self.maa.relax_custom_db(changed)
+
+    def test_readback_mismatch_retains_failure_instead_of_success(self):
+        def azure(*args, **kwargs):
+            if args[2] == "readback-policy":
+                return self.response(self.original)
+            return self.fake_azure(*args, **kwargs)
+        with patch.object(self.maa, "azure", side_effect=azure):
+            with self.assertRaisesRegex(self.maa.deploy.DeploymentError, "exact requested bytes"):
+                self.maa.setup(self.args)
+        run = Path(self.args.evidence_directory)
+        self.assertTrue(json.loads((run / "failure.json").read_text())["providerMayRemain"])
+        self.assertFalse((run / "setup.json").exists())
+        self.assertFalse((run / "endpoint.txt").exists())
+
+    def test_policy_response_rejects_wrong_issuer_and_malformed_jwt(self):
+        with self.assertRaisesRegex(self.maa.deploy.DeploymentError, "issuer"):
+            self.maa.policy_text(self.response(self.original, "https://unexpected.attest.azure.net"),
+                                 ENDPOINT)
+        with self.assertRaisesRegex(self.maa.deploy.DeploymentError, "Malformed"):
+            self.maa.policy_text({"token": "not-a-jwt"}, ENDPOINT)
+
+    def test_azure_failure_preserves_private_stderr_without_echoing_it(self):
+        with patch.object(self.maa.deploy, "azure_executable", return_value=["az"]), \
+                patch.object(self.maa.deploy, "command", return_value=SimpleNamespace(
+                    returncode=1, stdout=b"", stderr=b"private-error-fixture")):
+            with self.assertRaises(self.maa.deploy.DeploymentError) as error:
+                self.maa.azure(self.root, self.args.subscription_id, "failed-operation",
+                               "rest", "--method", "get", "--url", ENDPOINT)
+        self.assertNotIn("private-error-fixture", str(error.exception))
+        self.assertEqual((self.root / "failed-operation.stderr").read_bytes(),
+                         b"private-error-fixture")
 
 
 if __name__ == "__main__":

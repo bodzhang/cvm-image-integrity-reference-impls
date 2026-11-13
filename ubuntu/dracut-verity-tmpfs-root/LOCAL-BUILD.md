@@ -566,6 +566,97 @@ supports this type in API version `2025-06-01`; older CLI documentation does not
 necessarily list it. An AAD-trust provider requires authenticated policy
 management with the `https://attest.azure.net` resource.
 
+#### Create your own test provider
+
+Use Azure CLI and Python 3 from the relying-party/controller host, not the CVM.
+The helper uses `az resource` and `az rest`; the experimental `az attestation`
+extension is not required. You need permission to create an attestation provider
+in the selected resource group and manage its `AzureGuest` policy. Organization
+policy must permit the provider's public HTTPS endpoint and guest access to it.
+If provider registration is restricted, ask your subscription administrator
+to register `Microsoft.Attestation`.
+
+Run `az login` using your organization's approved flow. Choose a **dedicated
+test resource group**, a globally unique provider name and a new private evidence
+directory outside the checkout:
+
+```bash
+# Run from ubuntu/dracut-verity-tmpfs-root.
+subscription='<your-subscription-guid>'
+maa_rg='rg-my-cvm-maa-test'
+provider='mycvmmaatest12345' # Replace with your globally unique name.
+location='westus3'
+maa_evidence="$HOME/cvm-maa-runs/$provider"
+
+# Subscription-level registration may require an administrator.
+az provider register --namespace Microsoft.Attestation --wait \
+  --subscription "$subscription"
+az group create --name "$maa_rg" --location "$location" \
+  --subscription "$subscription"
+
+python3 scripts/setup-maa-test-provider.py \
+  --subscription-id "$subscription" --resource-group "$maa_rg" \
+  --provider-name "$provider" --location "$location" \
+  --evidence-directory "$maa_evidence" --allow-custom-db
+
+endpoint=$(cat "$maa_evidence/endpoint.txt")
+printf 'Approved test endpoint: %s\n' "$endpoint"
+```
+
+The explicit `--allow-custom-db` flag acknowledges the **test-only policy
+relaxation**, not an assertion that the custom firmware db passed validation.
+The helper refuses an existing provider or evidence directory. It creates a
+new AAD-trust provider, verifies its identity/trust model, retrieves its actual
+default policy and checks the expected security denials before modifying it.
+It does not create an image, change VM networking or alter a shared provider.
+Provider management uses ARM API `2020-10-01`; policy operations use the
+[`AzureGuest` policy REST API](https://learn.microsoft.com/en-us/rest/api/attestation/policy/get?view=rest-attestation-2025-06-01)
+version `2025-06-01`. `az rest --resource https://attest.azure.net` supplies
+the policy-management authentication without printing or storing an access
+token. Policy requests use private `--body @file` transport.
+
+Keep the evidence private. It includes `default-policy.txt`, a restorable
+`default-policy.jwt`, `test-policy.txt`, `test-policy.jwt`, exact
+`readback-policy.txt`, `endpoint.txt`, provider/operation responses and
+`setup.json` with resource identity and policy hashes. The helper reports
+success only after exact policy readback matches. On failure, it preserves
+evidence and may leave the newly created provider for inspection; it does not
+automatically delete resources or claim that a partial setup succeeded.
+On Windows, the same Python helper supports native Azure CLI; use a private
+Windows evidence directory with current-user-only ACLs.
+
+Supply `endpoint.txt`'s URL as `--maa-endpoint` / `-MaaEndpoint` for optional
+SSH-mode deployment, or as `--endpoint` to the installed `cvm-attest` command
+over authenticated SSH. Default managed acceptance still does not run the SDK.
+Creating this provider alone is not an attestation test: retain and verify the
+actual SDK request, quote and MAA token as described above.
+
+To restore the original default policy while retaining this test provider:
+
+```bash
+az rest --method put --resource https://attest.azure.net \
+  --url "$endpoint/policies/AzureGuest?api-version=2025-06-01" \
+  --headers 'Content-Type=text/plain' \
+  --body "@$maa_evidence/default-policy.jwt" --subscription "$subscription"
+```
+
+For native Windows Azure CLI invoked from WSL, translate that restore command's
+body filename with `wslpath -w`; the Python setup helper handles this translation
+automatically. After restoring, retrieve the policy and compare its decoded
+text with `default-policy.txt` before relying on it.
+When no longer needed, delete **only your dedicated test provider**:
+
+```bash
+az resource delete --resource-group "$maa_rg" --name "$provider" \
+  --resource-type Microsoft.Attestation/attestationProviders \
+  --api-version 2020-10-01 --subscription "$subscription"
+```
+
+This is separate from image/controller cleanup. Review retained-resource charges
+and do not delete a resource group containing unrelated resources.
+
+#### Policy exception and remaining verification requirements
+
 Retrieve and retain the provider's actual default policy before modifying it.
 The test policy removes only:
 
