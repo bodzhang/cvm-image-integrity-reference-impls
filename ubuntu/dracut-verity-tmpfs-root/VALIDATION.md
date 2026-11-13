@@ -8,9 +8,9 @@
 | --- | --- |
 | Marketplace catalog | Read-only Azure queries on 2026-11-12 returned the pinned non-Pro Ubuntu 24.04 CVM version in westus3, x64/Gen2 and `TrustedLaunchAndConfidentialVmSupported` |
 | Offline policy tests | 15 tests passed: generalized-source guards, writable-state finalization, pinned input, exact generated boot inputs, private mount-propagation enforcement, temporary resolver permissions/exact restoration, required switch-root dependency, volatile-service override, shared-parent setup and root-policy success/rejection paths |
-| Guest-verifier tests | 3 tests passed: completed clean cloud-init, explicit recoverable-warning reporting, and fatal/incomplete/malformed-status rejection |
+| Guest-verifier tests | 4 tests passed: completed clean cloud-init, explicit recoverable-warning reporting, fatal/incomplete/malformed-status rejection and installed collector/wrapper/provenance checks against independent build evidence |
 | Real userspace tests | SHA-256 verity format/verification and corrupted-data/wrong-hash rejection; kernel-less Dracut/systemd initramfs and RSA-signed systemd-stub UKI, exact section checks and changed-command-line rejection |
-| Pinned patched attestation SDK | Exact recipe patch application and default RustCrypto release build passed: 34 event-log and 70 guest-attestation tests. Native backend passed those 104 plus 24 client regressions. Genuine retained firmware/userspace logs produced byte-identical supplementation and matched the actual CVM quote. Wrapper's 9 tests require `0-8,11,12`, report the PCR12 gap, check paired SDK overrides and reject incomplete evidence/fallback without claiming remote verification |
+| Pinned patched attestation SDK | Exact recipe patch application and default RustCrypto release build passed: 34 event-log and 70 guest-attestation tests. Native backend passed those 104 plus 24 client regressions. Genuine retained firmware/userspace logs produced byte-identical supplementation and matched the actual CVM quote. Wrapper/build's 10 tests require `0-8,11,12`, report the PCR12 gap, check paired SDK overrides and pre-hash installation, and reject incomplete evidence/fallback without claiming remote verification |
 | Complete Marketplace conversion | **Passed on 2026-11-12** using an unbooted disk from the exact Marketplace pin on a dedicated Ubuntu 24.04 Azure builder; complete build marker includes fixed-VHD validation |
 | Kernel/driver compatibility | Matching signed-module gates passed for original kernel `7.0.0-1016-azure-fde`; source configuration includes `CONFIG_INTEL_TDX_GUEST=y`; this kernel booted the tested Intel TDX `Standard_DC4es_v6` CVM |
 | Real live dm-verity corruption | **Passed in the complete image build**: disposable corrupted data rejected both offline verification and live mapper reads, with mapper status `C` |
@@ -19,6 +19,8 @@
 | First boot / workload / real reboot | **Passed**: full verity verification and firmware/kernel/hash/device/agent checks on both boots; 136 MiB and 2,051 measured tmpfs inodes; distinct reboot ID and entire workload absent |
 | Actual PCR-11 quote / MAA flow | Installed SDK failed on omitted systemd phase events; genuine combined replay matches actual PCR 11. Tmpfs-only supplemented-log diagnostic obtained a real custom-policy MAA token: signature/issuer/lifetime and signed raw values verified for `0-8,11`. PCR 12 was requested but omitted from token coverage. **Installed collector and independent expected-UKI verification remain unqualified** |
 | Native patched collector / expanded PCRs | **Passed on 2026-11-13** directly in CVM tmpfs without firmware-log bind mounts: requested exactly `0-8,11,12`; real custom-policy MAA token signature/issuer/lifetime and signed values verified for `0-8,11`; explicit missing-PCR12 warning and incomplete-coverage receipt. Full results retrieved over authenticated SSH with matching SHA256 hashes |
+| Complete native-collector image rebuild | **Passed on 2026-11-13** on the retained dedicated builder using the same independently inspected source and signer: 104 SDK tests, pre-hash installed collector/wrapper/provenance gate, signed UKI sections, verity/corruption and fixed-VHD checks passed. Final output hashes and SSH-retrieved evidence archive verified |
+| Native-collector Gallery 1.0.4 / SSH acceptance | **Passed on 2026-11-13**: completed replication and exact signer/template readback; actual Intel TDX CVM first/reboot SSH acceptance with installed binary/wrapper/provenance checked on both boots; 136 MiB / 2,051 inode workload absent after distinct boot; installed collector obtained independently verified custom-policy MAA token for PCRs 0-8,11, with the PCR12 gap retained. Reference confirmed deallocated; previous Gallery versions and custom policy retained |
 
 These tests are not simulated evidence of Azure firmware behavior. A UKI with
 a synthetic kernel payload proves packaging/signature/section binding only.
@@ -257,10 +259,74 @@ remain private. The custom endpoint and working Gallery image were freshly
 confirmed retained.
 
 Gallery 1.0.3's protected lower still contains the original collector; the tmpfs
-test does not update it. Future recipe builds install the patched SDK before
-verity generation. AK/quote/TEE authentication, fresh challenge-bound quotes and
+test does not update it. Current recipe builds install the patched SDK before
+verity generation. The build now checks the installed binary, wrapper and
+provenance after package operations and records their hashes in independent
+build evidence. Guest acceptance checks those files on both boots when supplied
+the new build record; legacy records explicitly leave the collector unchecked.
+These gates alone do not establish Azure boot or installed-collector MAA
+acceptance; the separate Gallery 1.0.4 tests below supply that evidence.
+AK/quote/TEE authentication, fresh challenge-bound quotes and
 independent expected-UKI identity remain separate, unimplemented verification
 requirements; this test does not claim production remote image verification.
+
+## Rebuilt image with the native collector
+
+On 2026-11-13 the updated recipe completed a new image build on the retained
+exclusive Azure builder. The retained raw source was compared byte-for-byte
+with the unmounted original source disk before building; the inspected original
+kernel `7.0.0-1016-azure-fde`, matching modules and original signer were reused.
+The SDK's 34 event-log and 70 guest-attestation tests passed. Its built binary
+SHA256 matches the native collector previously tested in CVM tmpfs above.
+
+The installed binary, expanded-PCR wrapper and SDK provenance passed the final
+pre-hash gate. The signed UKI, exact sections, full verity verification, real
+offline/live corruption rejection and fixed-VHD gates passed, followed by
+independent rechecks of all output hashes. Build mounts were released.
+
+- Root hash: `637b0ed40d72ca6938cad5fd6006e067f4017f8c394722f8558f60912bdd6382`.
+- Fixed VHD SHA256: `302175eccdfe27a47f282f3fdef6af1fefb8db892a80ca79d742ad8b0eb639dc`.
+- Signed UKI SHA256: `e9a3c2c3ea28722052b741cf8d77cbf01b13eacc374b5b12abc17a65fce0659c`.
+
+The complete build evidence was retrieved over authenticated SSH; the archive's
+SHA256 matched the builder before extraction and its final build/installation
+records agree. The rebuilt image remains on the builder and was subsequently
+uploaded through its managed identity to a new private page blob, without
+changing previous image blobs or the MAA policy.
+
+### Gallery 1.0.4 publication and installed-collector acceptance
+
+The new version completed replication with the exact original signer and
+Microsoft UEFI template read back from Azure. With the test owner's approval,
+the existing reference CVM was replaced, retaining its network and all previous
+Gallery versions. Its actual control-plane model confirms Gallery 1.0.4,
+`Standard_DC4es_v6`, `ConfidentialVM`, Secure Boot/vTPM and `VMGuestStateOnly`.
+
+Both guest checks ran over SSH, not managed Run Command. The initial host key
+was authenticated from Azure boot diagnostics containing the independently
+expected new root hash. After the real guest-requested reboot, the regenerated
+host key was independently authenticated before reconnecting. Both boots passed
+full verity, firmware signer, kernel, root/device, tmpfs, installed
+collector/wrapper/provenance and agent checks. The first boot allocated
+142,610,432 bytes and 2,051 inodes. Distinct boot IDs and disappearance of the
+complete workload passed. Cloud-init completed without fatal errors on both
+boots; its recoverable post-reboot warning was explicitly retained.
+
+The installed collector, without SDK overrides, log bind mounts or compilation
+in the CVM, requested exactly `0-8,11,12` with a fresh relying-party challenge.
+The unchanged custom-policy provider issued a token whose RS256 signature,
+approved issuer, lifetime, retained validation claims and raw signed PCR values
+for `0-8,11` were independently verified against the request. The signed PCR11
+value was `34405150ce4b09a900fd40f2d9eab08805a2b312c745e02ee77ccfd18771fe50`.
+PCR12 remains absent from signed coverage/values and is not claimed as attested.
+The complete private response, request, token, receipt and stderr were retrieved
+over authenticated SSH; every transferred SHA256 matched the guest.
+
+The reference was subsequently confirmed deallocated. Gallery 1.0.4, previous
+Gallery versions, the builder/signing inputs and custom endpoint remain
+retained. This qualifies the installed evidence collector on the tested image,
+not independent AK/quote/TEE authentication, fresh quote challenge binding,
+expected-UKI remote identity, stateless boot or production-complete attestation.
 
 ## Required before claiming a demonstrated configuration
 
@@ -276,15 +342,23 @@ requirements; this test does not claim production remote image verification.
 4. Run the guest verifier using independently retained build inputs. Confirm
    firmware db and live kernel/hash/device identities, healthy read-only verity
    lower, writable tmpfs overlay, no swap, usable agents and cloud-init.
+   Use authenticated SSH to the launched CVM, with strict host-key checks and
+   an approved network path, rather than managed Run Command. For new builds,
+   require installed collector/wrapper hashes and provenance to match the
+   independent build record.
 5. Save first-boot evidence outside the guest, perform a real reboot, and require
    a different boot ID and disappearance of the measured tmpfs workload.
+   Independently authenticate the regenerated SSH host key before reconnecting;
+   restage the verifier and independent inputs over SSH.
 6. Qualify firmware removable-media boot behavior, kernel CVM hardware support,
    failure behavior under corruption and deployment cleanup in that environment.
 7. Run the installed `cvm-attest` over SSH with a relying-party challenge and an
    explicit approved MAA endpoint. Retain the quote, PCR values, TEE evidence,
    event log and returned token. Require independent verification of token,
    AK/quote/TEE binding, freshness and expected full UKI measurements before
-   calling the expected root hash attested. A PCR-11 coverage index is not its
+   calling the expected root hash attested. Retrieve complete private output
+   over authenticated SSH and check transferred file hashes; do not reuse stale
+   managed-command output as evidence. A PCR-11 coverage index is not its
    digest; the observed signed `x-ms-azurevm-attested-pcr-values` claim provides
    raw values only for the listed PCRs. User-data binds the TEE report, not
    quote `extraData`.

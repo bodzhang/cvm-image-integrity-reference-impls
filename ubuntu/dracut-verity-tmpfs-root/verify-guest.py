@@ -2,6 +2,7 @@
 """Guest acceptance; supply build evidence retained independently of the guest."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -51,6 +52,17 @@ def cloud_init_status():
     return status
 
 
+def verify_attestation_collector(expected, root=Path("/")):
+    sdk = expected["attestationSdk"]
+    installed = json.loads((root / "etc/cvm-verity/attestation-sdk.json").read_text())
+    provenance = {key: value for key, value in sdk.items() if key != "wrapperSha256"}
+    require(installed == provenance, "Installed SDK provenance differs from build evidence")
+    for name, field in (("azure-guest-attest", "binarySha256"), ("cvm-attest", "wrapperSha256")):
+        digest = hashlib.sha256((root / "usr/local/bin" / name).read_bytes()).hexdigest()
+        require(digest == sdk[field], f"Installed {name} differs from build evidence")
+    return sdk
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("build_json", type=Path)
@@ -59,6 +71,12 @@ def main():
     args = parser.parse_args()
     require(os.geteuid() == 0, "Run as root")
     expected = json.loads(args.build_json.read_text())
+    collector = None
+    if "attestationSdk" in expected:
+        collector = verify_attestation_collector(expected)
+    else:
+        print("CVM_ATTESTATION_COLLECTOR_NOT_CHECKED: legacy build record lacks SDK evidence",
+              file=sys.stderr)
     require(run("uname", "-r") == expected["kernel"], "Kernel does not match build evidence")
     efivars = Path("/sys/firmware/efi/efivars")
     require((efivars / f"SecureBoot-{GUID}").read_bytes()[4:] == b"\x01", "Secure Boot is not enabled")
@@ -116,6 +134,7 @@ def main():
         workload = {"allocatedBytes": allocated, "allocatedInodes": inodes}
     print(json.dumps({"result": "GUEST_ACCEPTANCE_PASSED", "bootId": boot_id,
                       "rootHash": expected["rootHash"], "workload": workload,
+                      "attestationSdk": collector,
                       "cloudInit": cloud_init}, indent=2))
 
 

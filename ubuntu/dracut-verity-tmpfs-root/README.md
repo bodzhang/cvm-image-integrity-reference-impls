@@ -14,8 +14,10 @@ boot and first-boot/real-reboot acceptance passed on an Azure Intel TDX CVM
 using `VMGuestStateOnly`. The patched native SDK collector, tested directly in
 tmpfs without log bind mounts, also obtained a signature-verified custom-policy
 MAA token for PCRs 0-8 and 11. PCR12 remains a token-coverage gap. Stateless boot
-and expected-image remote verification remain unqualified; the retained Gallery
-1.0.3 image still contains the old firmware-only collector.**
+and expected-image remote verification remain unqualified. Gallery 1.0.4,
+rebuilt with the native collector, passed publication, first/reboot SSH
+acceptance and installed-collector custom-policy MAA testing on 2026-11-13.
+Older Gallery 1.0.3 still contains the firmware-only collector.**
 See [the observed evidence and limits](VALIDATION.md).
 Do not claim production integrity or remote image verification from these tests.
 
@@ -173,7 +175,11 @@ lockfile and default RustCrypto/rustls backend. It installs the binary, MIT lice
 the `cvm-attest` wrapper into the root **before hashing**, and checks that both
 commands run inside the target chroot. Compiler/binary/revision evidence is
 retained in `evidence/attestation-sdk.json`, including the base revision and patch
-file/hash. No attestation request is made
+file/hash. After package operations and before verity generation, a final gate
+compares the installed binary, wrapper and SDK provenance with the builder
+inputs. `evidence/attestation-installation.json` and `evidence/build.json` retain
+the SDK provenance plus binary and wrapper SHA-256 hashes for independent
+guest validation. No attestation request is made
 during the offline build; no compiler or SDK source tree is baked into the guest.
 
 The build chroots into a **new copy** of the source and installs `dracut-core`,
@@ -275,23 +281,70 @@ key.
 
 ## 4. Accept the deployed CVM, including a real reboot
 
+Use SSH to the launched CVM through an approved private or corporate-network
+path; do not open public SSH ingress just for validation. Authenticate the
+current host key against trusted Azure boot diagnostics or another independently
+authenticated channel **before connecting**. An `ssh-keyscan` result alone is
+not authentication. Populate a dedicated known-hosts file with that verified
+key; never use `StrictHostKeyChecking=no` or discard a mismatch.
+
 Copy [verify-guest.py](verify-guest.py), independently retained
-`evidence/build.json`, and `signer.der` to the guest using your approved channel.
+`evidence/build.json`, and `signer.der` over SSH into a private staging directory.
 Use the **local build record**, not hashes supplied only by the running guest.
+Run these commands on the validation client, from this recipe directory.
+The provisioned account must support noninteractive sudo.
 
 ```bash
-sudo python3 verify-guest.py build.json signer.der > first-boot.json
-# Retrieve first-boot.json outside the guest, including its bootId.
-sudo systemctl reboot
-# Reconnect; copy verifier/build record/certificate again (the root is volatile).
-sudo python3 verify-guest.py build.json signer.der \
-  --previous-boot-id '<bootId-from-first-boot.json>' > reboot.json
+set -euo pipefail
+umask 077
+target='<provisioned-user>@<approved-CVM-address>'
+identity='/secure/ssh/validation-key'
+known_hosts='/secure/ssh/cvm-known-hosts'
+build='/secure/runs/dracut-example'
+mkdir -m 700 /secure/validation/dracut-example
+evidence='/secure/validation/dracut-example'
+ssh_options=(-i "$identity" -o IdentitiesOnly=yes -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known_hosts")
+
+stage=$(ssh "${ssh_options[@]}" "$target" \
+  'umask 077; mktemp -d /tmp/cvm-validation.XXXXXXXX')
+[[ "$stage" =~ ^/tmp/cvm-validation\.[a-zA-Z0-9]{8}$ ]]
+scp "${ssh_options[@]}" verify-guest.py "$build/evidence/build.json" \
+  "$build/signer.der" "$target:$stage/"
+ssh "${ssh_options[@]}" "$target" \
+  "sudo -n python3 '$stage/verify-guest.py' '$stage/build.json' '$stage/signer.der'" \
+  > "$evidence/first-boot.json" 2> "$evidence/first-boot.stderr.log"
+previous_boot_id=$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["bootId"])' \
+  "$evidence/first-boot.json")
+ssh "${ssh_options[@]}" "$target" 'sudo -n systemctl reboot'
+```
+
+After the CVM returns, independently authenticate its **new** host key and
+update the dedicated known-hosts file. This image regenerates host keys on every
+boot; do not automatically trust replacement keys. Then stage the inputs again:
+
+```bash
+stage=$(ssh "${ssh_options[@]}" "$target" \
+  'umask 077; mktemp -d /tmp/cvm-validation.XXXXXXXX')
+[[ "$stage" =~ ^/tmp/cvm-validation\.[a-zA-Z0-9]{8}$ ]]
+scp "${ssh_options[@]}" verify-guest.py "$build/evidence/build.json" \
+  "$build/signer.der" "$target:$stage/"
+ssh "${ssh_options[@]}" "$target" \
+  "sudo -n python3 '$stage/verify-guest.py' '$stage/build.json' '$stage/signer.der' \
+    --previous-boot-id '$previous_boot_id'" \
+  > "$evidence/reboot.json" 2> "$evidence/reboot.stderr.log"
 ```
 
 First-boot checks include firmware Secure Boot/SetupMode/db signer, TPM, exact
 kernel and boot arguments, the live verity table's hash/devices, full offline
 verity verification, tmpfs/root policy, cloud-init, guest agent and failed
-systemd units. It requires at least 128 MiB of measured tmpfs block allocation
+systemd units. New build records also require the installed native collector,
+wrapper and provenance to match independent build evidence on both boots.
+Legacy records without SDK evidence explicitly report that the collector was
+not checked; they cannot qualify the updated collector. These local file checks
+are not authenticated remote execution or expected-UKI proof.
+It requires at least 128 MiB of measured tmpfs block allocation
 and 2,050 new inodes from 128 MiB plus 2,048 small files and reboot markers.
 Reboot acceptance requires a distinct boot ID and loss of the entire workload.
 Completed cloud-init status with exit 2 is accepted only with no reported fatal
@@ -308,7 +361,7 @@ After deploying and completing root-policy acceptance, SSH into the CVM and
 run the installed `cvm-attest` command. No attestation service runs automatically,
 and no SDK download or compilation is required in the running guest.
 
-**Existing-image limitation:** Gallery 1.0.3's installed SDK reads only the firmware event log,
+**Older-image limitation:** Gallery 1.0.3's installed SDK reads only the firmware event log,
 omitting genuine systemd boot-phase extensions into PCR 11. The tested shared
 West US 3 MAA endpoint rejects this with `PcrDoesNotMatchTcg`. A tmpfs-only
 diagnostic appended genuine recorded phase events and quoted PCRs `0-7,11`;
@@ -317,19 +370,41 @@ No token was issued by that shared endpoint. A separately owned endpoint,
 removing only the dbvalidated denial, subsequently issued a real token for the
 expanded diagnostic. That diagnostic did not change the installed collector.
 Current source builds instead apply the native SDK fix described below and
-require the expanded PCR set. The retained Gallery 1.0.3 image has not been
-rebuilt or replaced. See [the attestation investigation](VALIDATION.md).
+require the expanded PCR set. Gallery 1.0.4 was built and published separately;
+its installed native collector passed custom-policy MAA testing after real
+first/reboot SSH acceptance. Gallery 1.0.3 remains retained but its former
+reference CVM was replaced with the tested 1.0.4 CVM, now deallocated.
+See [the attestation investigation](VALIDATION.md).
 
 ```bash
 # On the relying party: generate and retain a fresh challenge for this request.
-openssl rand -hex 32
+nonce=$(openssl rand -hex 32)
+printf '%s\n' "$nonce" > "$evidence/nonce.txt"
+# Reuse the authenticated SSH options from step 4, after reboot-key verification.
+ssh "${ssh_options[@]}" "$target" \
+  "sudo -n /usr/local/bin/cvm-attest \
+    --endpoint 'https://<your-approved-provider>.attest.azure.net' \
+    --nonce '$nonce' --output /run/cvm-attestation-example" \
+  > "$evidence/attestation.stdout.json" 2> "$evidence/attestation.stderr.log"
 
-# Over SSH in the CVM, paste that challenge (not a guest-generated freshness proof):
-sudo cvm-attest \
-  --endpoint 'https://<your-approved-provider>.attest.azure.net' \
-  --nonce '<64-lowercase-hex-characters-from-the-relying-party>' \
-  --output /run/cvm-attestation-example
+# Retrieve private files directly, without managed Run Command or SDK overrides.
+mkdir -m 700 "$evidence/attestation"
+for file in sdk-response.json request.json token.txt sdk-stderr.log receipt.json; do
+  ssh "${ssh_options[@]}" "$target" \
+    "sudo -n cat '/run/cvm-attestation-example/$file'" \
+    > "$evidence/attestation/$file"
+done
+ssh "${ssh_options[@]}" "$target" \
+  'sudo -n sh -c "cd /run/cvm-attestation-example && sha256sum \
+    sdk-response.json request.json token.txt sdk-stderr.log receipt.json"' \
+  > "$evidence/attestation/SHA256SUMS"
+(cd "$evidence/attestation" && sha256sum --check SHA256SUMS)
 ```
+
+Use a new `/run` output name for each collection. If collection fails, retain
+stderr and retrieve any existing diagnostic files over the same authenticated
+SSH connection; do not treat partial output as acceptance. File hashes establish
+transfer consistency, not remote attestation authenticity.
 
 The wrapper always invokes the pinned SDK's **guest** attestation flow with
 `--provider maa --pcr-index 0,1,2,3,4,5,6,7,8,11,12 --user-data hex:<nonce> --json --show-request`.
@@ -481,8 +556,8 @@ quote/TEE/freshness checks above. Keep genuine systemd userspace events in the
 attestation evidence; changing policy does not repair a PCR/event-log mismatch.
 The tested expanded diagnostic requests PCRs `0,1,2,3,4,5,6,7,8,11,12`.
 Neither this policy nor a tmpfs SDK diagnostic changes Gallery 1.0.3's installed
-firmware-only collector. Future recipe builds install the patched SDK and
-expanded-PCR wrapper before generating verity data.
+firmware-only collector. Current recipe builds install the patched SDK and
+expanded-PCR wrapper before generating verity data, as tested in Gallery 1.0.4.
 
 ## Threat model and limits
 

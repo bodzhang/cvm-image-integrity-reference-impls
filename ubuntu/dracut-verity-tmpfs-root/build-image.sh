@@ -203,6 +203,22 @@ fi
 chroot "$run/root" apt-get clean
 truncate -s 0 "$run/root/etc/machine-id"
 find "$run/root/etc/ssh" -maxdepth 1 -type f -name 'ssh_host_*_key*' -delete
+python3 - "$run" "$recipe" <<'PY'
+import hashlib, json, pathlib, sys
+run, recipe = map(pathlib.Path, sys.argv[1:])
+sdk = json.loads((run / "evidence/attestation-sdk.json").read_text())
+installed = json.loads((run / "root/etc/cvm-verity/attestation-sdk.json").read_text())
+if installed != sdk:
+    raise ValueError("Installed SDK provenance differs from the builder record")
+binary = run / "root/usr/local/bin/azure-guest-attest"
+if hashlib.sha256(binary.read_bytes()).hexdigest() != sdk["binarySha256"]:
+    raise ValueError("Installed native collector differs from the built SDK")
+wrapper = (recipe / "attest-guest.py").read_bytes()
+if (run / "root/usr/local/bin/cvm-attest").read_bytes() != wrapper:
+    raise ValueError("Installed attestation wrapper differs from the recipe")
+sdk["wrapperSha256"] = hashlib.sha256(wrapper).hexdigest()
+(run / "evidence/attestation-installation.json").write_text(json.dumps(sdk, indent=2) + "\n")
+PY
 unmount_last # /run
 unmount_last # /sys
 unmount_last # /dev
@@ -255,6 +271,7 @@ if (footer[:8] != b"conectix" or struct.unpack_from(">I", footer, 60)[0] != 2
 (run / "evidence/build.json").write_text(json.dumps(dict(
     imageUrn=sys.argv[2], kernel=sys.argv[3], rootHash=sys.argv[4],
     dataPartUuid=sys.argv[5], hashPartUuid=sys.argv[6],
+    attestationSdk=json.loads((run / "evidence/attestation-installation.json").read_text()),
     validation="offline build only; Azure CVM acceptance required",
 ), indent=2) + "\n")
 PY

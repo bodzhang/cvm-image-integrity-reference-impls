@@ -2,11 +2,13 @@
 """Cloud-init acceptance must distinguish reported warnings from fatal errors."""
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -48,6 +50,32 @@ class CloudInitTests(unittest.TestCase):
         ):
             with self.subTest(code=code, changes=changes), self.assertRaises(RuntimeError):
                 self.check(code, **changes)
+
+
+class CollectorTests(unittest.TestCase):
+    def test_checks_installed_collector_against_independent_build_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "usr/local/bin/azure-guest-attest"
+            wrapper = root / "usr/local/bin/cvm-attest"
+            record = root / "etc/cvm-verity/attestation-sdk.json"
+            binary.parent.mkdir(parents=True)
+            record.parent.mkdir(parents=True)
+            binary.write_bytes(b"native collector fixture")
+            wrapper.write_bytes(b"expanded PCR wrapper fixture")
+            sdk = {"revision": "fixture", "patch": {"sha256": "patch fixture"},
+                   "binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
+            record.write_text(json.dumps(sdk))
+            expected = {"attestationSdk": dict(
+                sdk, wrapperSha256=hashlib.sha256(wrapper.read_bytes()).hexdigest())}
+            self.assertEqual(guest.verify_attestation_collector(expected, root),
+                             expected["attestationSdk"])
+            for target in (binary, wrapper, record):
+                original = target.read_bytes()
+                target.write_bytes(b"{}" if target == record else b"old collector or changed wrapper")
+                with self.subTest(target=target), self.assertRaises(RuntimeError):
+                    guest.verify_attestation_collector(expected, root)
+                target.write_bytes(original)
 
 
 if __name__ == "__main__":

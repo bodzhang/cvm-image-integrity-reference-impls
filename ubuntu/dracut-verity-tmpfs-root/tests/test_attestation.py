@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -148,6 +149,47 @@ class AttestationTests(unittest.TestCase):
         self.assertIn('apply --check "$patch_path"', build)
         self.assertIn('apply "$patch_path"', build)
         self.assertIn('cargo test --locked', build)
+
+    def test_pre_hash_gate_checks_installed_native_collector_and_wrapper(self):
+        script = (RECIPE / "build-image.sh").read_text()
+        start = script.index('python3 - "$run" "$recipe"')
+        gate = script[start:script.index("\nPY", start) + 3]
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            binary = run / "root/usr/local/bin/azure-guest-attest"
+            wrapper = run / "root/usr/local/bin/cvm-attest"
+            installed = run / "root/etc/cvm-verity/attestation-sdk.json"
+            evidence = run / "evidence"
+            binary.parent.mkdir(parents=True)
+            installed.parent.mkdir(parents=True)
+            evidence.mkdir()
+            binary.write_bytes(b"patched SDK fixture")
+            wrapper.write_bytes((RECIPE / "attest-guest.py").read_bytes())
+            sdk = {"binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                   "patch": {"sha256": "pinned patch fixture"}}
+            installed.write_text(json.dumps(sdk))
+            (evidence / "attestation-sdk.json").write_text(json.dumps(sdk))
+
+            def execute():
+                return subprocess.run(["bash", "-eu", "-c", 'run=$1\nrecipe=$2\n' + gate,
+                                       "test", str(run), str(RECIPE)],
+                                      capture_output=True, text=True)
+
+            result = execute()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = evidence / "attestation-installation.json"
+            self.assertEqual(json.loads(record.read_text())["wrapperSha256"],
+                             hashlib.sha256(wrapper.read_bytes()).hexdigest())
+            record.unlink()
+            for target in (binary, wrapper, installed):
+                original = target.read_bytes()
+                target.write_bytes(b"{}" if target == installed else b"stale installed code")
+                with self.subTest(target=target):
+                    result = execute()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(record.exists())
+                    self.assertIn("ValueError", result.stderr)
+                target.write_bytes(original)
 
     def test_complete_token_coverage_is_reported_without_verification_claim(self):
         with tempfile.TemporaryDirectory() as directory:
