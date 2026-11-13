@@ -38,13 +38,9 @@ foreach ($key in @('SshPrivateKey', 'SshSourceCidr', 'SshJumpHost', 'SshJumpKnow
     $managed.Remove($key)
 }
 $managed.ValidationTransport = 'managed'
-$managed.ReferenceNetworkTemplateNicId = (
-    '/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/approved' +
-    '/providers/Microsoft.Network/networkInterfaces/reference')
 $managedConfig = (& (Join-Path $recipe 'Deploy.ps1') @managed) | ConvertFrom-Json
-if ($managedConfig.validationTransport -ne 'managed' -or
-    $managedConfig.referenceNetworkTemplateNicId -ne $managed.ReferenceNetworkTemplateNicId) {
-    throw 'PowerShell deployment did not forward managed acceptance and the approved network template.'
+if ($managedConfig.validationTransport -ne 'managed') {
+    throw 'PowerShell deployment did not forward managed acceptance.'
 }
 if (Test-Path -LiteralPath $run) { throw 'Plan wrote a run directory.' }
 $parameters.Prefix = 'invalid prefix'

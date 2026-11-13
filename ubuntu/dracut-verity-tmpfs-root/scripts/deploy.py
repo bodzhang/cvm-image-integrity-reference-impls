@@ -33,7 +33,6 @@ CHECKOUT = RECIPE.parents[1]
 PURPOSE = "dracut-verity-tmpfs"
 BUILDER_IMAGE = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
 API = "2024-07-01"
-NETWORK_API = "2024-05-01"
 GALLERY_API = "2024-03-03"
 PCRS = list(range(9)) + [11, 12]
 ARTIFACT_READER = CHECKOUT / "ubuntu/verity-tmpfs-root/scripts/Read-ArtifactChunk.py"
@@ -148,12 +147,6 @@ def configuration(args):
         source = ipaddress.ip_network(args.ssh_source_cidr)
         require(source.version == 4 and any(source.subnet_of(item) for item in private_ranges),
                 "SSH source must be an approved corporate RFC1918 CIDR, never Internet SSH")
-    if args.reference_network_template_nic_id:
-        require(re.fullmatch(
-            r"/subscriptions/" + re.escape(args.subscription_id)
-            + r"/resourceGroups/[^/]+/providers/Microsoft.Network/networkInterfaces/[^/]+",
-            args.reference_network_template_nic_id, re.IGNORECASE),
-            "Reference network template must be an explicit NIC ID in the deployment subscription")
     run = validate_run_path(args.run_directory or Path.home() / "cvm-dracut-runs" / args.prefix)
     run_id = str(uuid.uuid4())
     prefix = args.prefix
@@ -175,12 +168,11 @@ def configuration(args):
         "runDirectory": str(run), "sshPublicKey": str(key_path),
         "maaEndpoint": args.maa_endpoint,
         "validationTransport": args.validation_transport,
-        "referenceNetworkTemplateNicId": args.reference_network_template_nic_id,
         "sshJumpHost": args.ssh_jump_host,
         "sshJumpKnownHosts": str(Path(args.ssh_jump_known_hosts).expanduser().resolve())
         if args.ssh_jump_known_hosts else None,
         "privateConnectivity": (
-            "Managed validation needs no inbound route; optional reference public SSH is enabled only after acceptance"
+            "Managed validation needs no inbound route; user must confirm/configure network access for later SSH"
             if args.validation_transport == "managed" else
             "SSH validation requires an approved route to the new private subnet"),
         "attestationVerification": "NOT_VERIFIED: collection only; PCR12 token coverage may be absent",
@@ -219,32 +211,6 @@ def azure_body_path(path):
         require(shutil.which("wslpath"), "WSL Windows Azure CLI requires wslpath for large request files")
         return command(["wslpath", "-w", str(path)]).stdout.decode().strip()
     return str(path)
-
-
-def network_rules(model):
-    fields = ("description", "protocol", "sourcePortRange", "sourcePortRanges",
-              "destinationPortRange", "destinationPortRanges", "sourceAddressPrefix",
-              "sourceAddressPrefixes", "destinationAddressPrefix", "destinationAddressPrefixes",
-              "access", "priority", "direction")
-    rules = []
-    for rule in model["properties"]["securityRules"]:
-        original = rule["properties"]
-        require(not original.get("sourceApplicationSecurityGroups")
-                and not original.get("destinationApplicationSecurityGroups"),
-                "Network templates with application security groups are not portable")
-        props = {key: original[key] for key in fields if original.get(key) not in (None, "", [])}
-        if props["direction"] == "Inbound" and props["access"] == "Allow" and props["protocol"] in ("Tcp", "*"):
-            ports = props.get("destinationPortRanges", []) + (
-                [props["destinationPortRange"]] if "destinationPortRange" in props else [])
-            ssh = any(port == "*" or int(port.split("-")[0]) <= 22 <= int(port.split("-")[-1])
-                      for port in ports)
-            sources = props.get("sourceAddressPrefixes", []) + (
-                [props["sourceAddressPrefix"]] if "sourceAddressPrefix" in props else [])
-            require(not ssh or sources and all(source.lower() not in (
-                "*", "internet", "0.0.0.0/0", "::/0") for source in sources),
-                "Reference network template must not allow unrestricted Internet SSH")
-        rules.append({"name": rule["name"], "properties": props})
-    return sorted(rules, key=lambda rule: rule["name"])
 
 
 def validate_public_key(path):
@@ -493,8 +459,6 @@ class Engine:
             require(int(values[0]) - int(values[1]) >= cpus,
                     "Insufficient regional/family VM quota: " + family)
         self.record("quota-preflight", {"needs": needs})
-        if self.c.get("referenceNetworkTemplateNicId"):
-            self.capture_reference_network()
 
     def network(self):
         c, group = self.c, self.c["resourceGroup"]
@@ -523,109 +487,6 @@ class Engine:
                          "-n", c["subnet"], "--network-security-group", c["networkSecurityGroup"],
                          "--nat-gateway", c["natGateway"], "--service-endpoints", "Microsoft.Storage")
         self.record("subnet", subnet)
-
-    def capture_reference_network(self):
-        nic = self.az("network", "nic", "show", "--ids", self.c["referenceNetworkTemplateNicId"])
-        require(nic["id"].lower() == self.c["referenceNetworkTemplateNicId"].lower(),
-                "Network template NIC ID mismatch")
-        configs = nic["ipConfigurations"]
-        require(len(configs) == 1 and configs[0].get("publicIPAddress")
-                and nic.get("networkSecurityGroup"), "Network template requires one public NIC with an NSG")
-        subnet = self.az("network", "vnet", "subnet", "show", "--ids", configs[0]["subnet"]["id"])
-        require(subnet.get("networkSecurityGroup"), "Network template subnet must have an NSG")
-        public = self.az("network", "public-ip", "show", "--ids", configs[0]["publicIPAddress"]["id"])
-        require(public["sku"]["name"] == "Standard" and public["sku"].get("tier", "Regional") == "Regional"
-                and public["publicIPAllocationMethod"] == "Static"
-                and public["publicIPAddressVersion"] == "IPv4", "Template requires a static Standard IPv4 public IP")
-        rules = {}
-        for key, ident in (("nicRules", nic["networkSecurityGroup"]["id"]),
-                           ("subnetRules", subnet["networkSecurityGroup"]["id"])):
-            require(ident.lower().startswith("/subscriptions/" + self.c["subscriptionId"].lower() + "/"),
-                    "Network template NSG is outside the deployment subscription")
-            model = self.rest("get", ident, api=NETWORK_API)
-            rules[key] = network_rules(model)
-        self.record("reference-network-template", {
-            "sourceNicId": nic["id"], "sourceSubnetId": subnet["id"],
-            "publicIp": "Standard/Regional/Static/IPv4", **rules})
-
-    def enable_reference_ssh(self):
-        if not self.c.get("referenceNetworkTemplateNicId"):
-            return
-        self.owned_group()
-        template = read_json(self.evidence / "reference-network-template.json")
-        require(template["sourceNicId"].lower() == self.c["referenceNetworkTemplateNicId"].lower(),
-                "Reference network template evidence changed")
-        model = self.vm("reference")
-        self.check_reference_model(model)
-        view = self.az("vm", "get-instance-view", "-g", self.c["resourceGroup"], "-n", self.c["referenceVm"])
-        require(any(item["code"] == "PowerState/deallocated" for item in view["instanceView"]["statuses"]),
-                "Reference must be deallocated before publishing corporate SSH")
-        configs = model["networkProfile"]["networkInterfaces"]
-        require(len(configs) == 1, "Unexpected reference NIC inventory")
-        nic = self.owned(self.az("network", "nic", "show", "--ids", configs[0]["id"]), "reference")
-        require(len(nic["ipConfigurations"]) == 1, "Unexpected reference IP configuration inventory")
-        subnet_id = read_json(self.evidence / "subnet.json")["id"]
-        require(nic["ipConfigurations"][0]["subnet"]["id"].lower() == subnet_id.lower(),
-                "Reference NIC moved outside the owned subnet")
-        nsg_id = base_id(self.c) + "/providers/Microsoft.Network/networkSecurityGroups/"
-        subnet = self.az("network", "vnet", "subnet", "show", "--ids", subnet_id)
-        require(subnet.get("networkSecurityGroup", {}).get("id", "").lower()
-                == (nsg_id + self.c["networkSecurityGroup"]).lower(),
-                "Reference subnet is no longer protected by the owned NSG")
-        inventory = self.az("resource", "list", "-g", self.c["resourceGroup"])
-        reference_nsg = self.c["referenceVm"] + "-nsg"
-        public_name = self.c["referenceVm"] + "-ssh"
-        expected_public = base_id(self.c) + "/providers/Microsoft.Network/publicIPAddresses/" + public_name
-        existing = nic["ipConfigurations"][0].get("publicIPAddress")
-        require(not existing or existing["id"].lower() == expected_public.lower(),
-                "Refusing to replace an unexpected public IP")
-        for resource in inventory:
-            if resource["name"] in (reference_nsg, public_name):
-                self.owned(self.az("resource", "show", "--ids", resource["id"]), "reference")
-        for name, rules, role in (
-            (reference_nsg, template["nicRules"], "reference"),
-            (self.c["networkSecurityGroup"], template["subnetRules"], "network"),
-        ):
-            ident = nsg_id + name
-            if role == "network":
-                self.owned(self.rest("get", ident, api=NETWORK_API), role)
-            desired = {"location": self.c["location"], "tags": dict(item.split("=", 1) for item in self.tags(role)),
-                       "properties": {"securityRules": rules}}
-            network_rules(desired)
-            self.rest("put", ident, desired, api=NETWORK_API)
-            actual = self.poll(lambda: self.rest("get", ident, api=NETWORK_API),
-                               lambda item: item["properties"].get("provisioningState") == "Succeeded",
-                               "Reference SSH NSG configuration")
-            self.owned(actual, role)
-            require(network_rules(actual) == rules, "Reference SSH NSG differs from the approved template")
-        self.az("network", "nic", "update", "--ids", nic["id"],
-                "--network-security-group", nsg_id + reference_nsg)
-        self.az("network", "public-ip", "create", "-g", self.c["resourceGroup"], "-n", public_name,
-                "--sku", "Standard", "--allocation-method", "Static", "--version", "IPv4",
-                "--tags", *self.tags("reference"))
-        public = self.owned(self.az("network", "public-ip", "show", "-g", self.c["resourceGroup"],
-                                   "-n", public_name), "reference")
-        require(public["id"].lower() == expected_public.lower(), "Reference public IP ID mismatch")
-        require(public["sku"]["name"] == "Standard" and public["sku"].get("tier", "Regional") == "Regional"
-                and public["publicIPAllocationMethod"] == "Static"
-                and public["publicIPAddressVersion"] == "IPv4"
-                and ipaddress.ip_address(public["ipAddress"]).version == 4,
-                "Reference public IP differs from the approved static Standard IPv4 configuration")
-        self.az("network", "nic", "ip-config", "update", "-g", self.c["resourceGroup"],
-                "--nic-name", nic["name"], "-n", nic["ipConfigurations"][0]["name"],
-                "--public-ip-address", public["id"])
-        actual = self.owned(self.az("network", "nic", "show", "--ids", nic["id"]), "reference")
-        require(actual["networkSecurityGroup"]["id"].lower() == (nsg_id + reference_nsg).lower()
-                and actual["ipConfigurations"][0]["publicIPAddress"]["id"].lower() == public["id"].lower(),
-                "Reference public SSH attachment did not match")
-        subnet = self.az("network", "vnet", "subnet", "show", "--ids", subnet_id)
-        require(subnet["networkSecurityGroup"]["id"].lower() == (nsg_id + self.c["networkSecurityGroup"]).lower(),
-                "Reference subnet NSG association changed during SSH publication")
-        self.record("reference-ssh", {
-            "address": public["ipAddress"], "port": 22, "adminUsername": self.c["adminUsername"],
-            "sourceNicId": template["sourceNicId"], "referenceDeallocated": True,
-            "hostKeyAuthentication": "Authenticate the new host key through Azure diagnostics after each start",
-        })
 
     def boot_config(self):
         # Bootcmd runs again when the volatile root is recreated. Key material
@@ -1303,12 +1164,11 @@ class Engine:
         require(not any(item["name"] in temporary for item in remaining), "Temporary resources remain after cleanup")
         vms = self.az("vm", "list", "-g", self.c["resourceGroup"])
         require(len(vms) == 1 and vms[0]["name"] == self.c["referenceVm"], "Unexpected retained VM inventory")
-        self.enable_reference_ssh()
-        remaining = self.az("resource", "list", "-g", self.c["resourceGroup"])
         self.record("cleanup-summary", {"temporaryResourcesDeleted": True, "referenceDeallocated": True,
                                        "galleryVersion": version_id(self.c), "resources": remaining,
-                                       "referenceSsh": read_json(self.evidence / "reference-ssh.json")
-                                       if self.c.get("referenceNetworkTemplateNicId") else None})
+                                       "sshAccess": "USER_CONFIRMATION_REQUIRED",
+                                       "referenceVm": self.c["referenceVm"],
+                                       "resourceGroup": self.c["resourceGroup"]})
 
     def deploy(self):
         try:
@@ -1338,8 +1198,6 @@ def parser():
     deploy.add_argument("--maa-endpoint")
     deploy.add_argument("--validation-transport", choices=("managed", "ssh"), default="managed",
                         help="Managed basic acceptance by default; ssh also collects installed SDK evidence")
-    deploy.add_argument("--reference-network-template-nic-id",
-                        help="Approved existing public NIC whose NIC/subnet NSG rules are copied after acceptance")
     deploy.add_argument("--ssh-source-cidr", help="Approved corporate RFC1918 source; controller must have private routing")
     deploy.add_argument("--ssh-jump-host", help="Optional user@host on an existing approved SSH path; uses the same private key")
     deploy.add_argument("--ssh-jump-known-hosts", help="Independently authenticated ED25519 known-hosts file for --ssh-jump-host")
@@ -1403,6 +1261,9 @@ def main(argv=None):
         Engine(config, str(private) if private else None).deploy()
         attestation = "NOT_VERIFIED" if ssh_validation else "NOT_RUN; collect over authenticated SSH after start"
         print("DEPLOYMENT_ACCEPTED: Gallery retained; reference deallocated; attestation " + attestation + "; evidence=" + str(run))
+        print("SSH_HANDOFF: VM=" + config["resourceGroup"] + "/" + config["referenceVm"]
+              + "; confirm or reconfigure approved network access before user-driven SSH/SDK testing."
+              + " Start the VM when needed and authenticate its current host key through Azure diagnostics.")
     else:
         run = validate_run_path(args.run_directory, must_be_new=False)
         config = read_json(run / "config.json")

@@ -636,85 +636,28 @@ class ManagedAcceptanceTests(Fixture):
         rest.assert_called_once_with("delete", owned["id"])
 
 
-class ReferenceNetworkTests(Fixture):
-    def rules(self, source="198.51.100.0/24"):
-        return [{"name": "corporate-ssh", "properties": {
-            "priority": 103, "direction": "Inbound", "access": "Allow", "protocol": "Tcp",
-            "sourceAddressPrefix": source, "sourcePortRange": "*",
-            "destinationAddressPrefix": "*", "destinationPortRange": "22",
-        }}]
-
-    def test_template_rejects_unrestricted_ssh_and_nonportable_security_groups(self):
-        for source in ("*", "Internet", "0.0.0.0/0", "::/0"):
-            with self.subTest(source=source), self.assertRaisesRegex(deploy.DeploymentError, "unrestricted"):
-                deploy.network_rules({"properties": {"securityRules": self.rules(source)}})
-        rules = self.rules()
-        rules[0]["properties"]["sourceApplicationSecurityGroups"] = [{"id": "/unrelated/asg"}]
-        with self.assertRaisesRegex(deploy.DeploymentError, "not portable"):
-            deploy.network_rules({"properties": {"securityRules": rules}})
-
-    def test_corporate_public_endpoint_copies_both_nsgs_only_after_deallocation(self):
-        self.config["referenceNetworkTemplateNicId"] = (
-            "/subscriptions/" + self.config["subscriptionId"]
-            + "/resourceGroups/approved/providers/Microsoft.Network/networkInterfaces/reference")
-        self.engine.record("reference-network-template", {
-            "sourceNicId": self.config["referenceNetworkTemplateNicId"],
-            "nicRules": self.rules(), "subnetRules": self.rules(),
-        })
-        base = deploy.base_id(self.config) + "/providers/Microsoft.Network/"
-        subnet = base + "virtualNetworks/v/subnets/cvm"
-        self.engine.record("subnet", {"id": subnet})
-        nic = dict(self.model(), id=base + "networkInterfaces/" + self.config["referenceVm"] + "-nic",
-                   name=self.config["referenceVm"] + "-nic",
-                   ipConfigurations=[{"name": "ipconfig1", "subnet": {"id": subnet}}])
-        model = dict(self.model(), networkProfile={"networkInterfaces": [{"id": nic["id"]}]})
-        public = dict(self.model(), id=base + "publicIPAddresses/" + self.config["referenceVm"] + "-ssh",
-                      ipAddress="203.0.113.24", sku={"name": "Standard", "tier": "Regional"},
-                      publicIPAllocationMethod="Static", publicIPAddressVersion="IPv4")
-        nsgs = {base + "networkSecurityGroups/" + self.config["networkSecurityGroup"]: {
-            "id": base + "networkSecurityGroups/" + self.config["networkSecurityGroup"],
-            "tags": dict(self.model()["tags"], role="network"),
-            "properties": {"securityRules": [], "provisioningState": "Succeeded"},
-        }}
-        puts = []
-        def rest(method, ident, body=None, **kwargs):
-            if method == "put":
-                puts.append(ident)
-                nsgs[ident] = dict(copy.deepcopy(body), id=ident)
-                nsgs[ident]["properties"]["provisioningState"] = "Succeeded"
-            return nsgs[ident]
+class RetainedReferenceTests(Fixture):
+    def test_cleanup_deallocates_and_hands_off_ssh_without_network_changes(self):
+        self.config["referenceNetworkTemplateNicId"] = "/previous-run/approved-nic"
+        deploy.write_json(self.engine.evidence / "builder-model.json", self.model("builder"))
         def azure(*args):
-            if args[:2] == ("vm", "get-instance-view"):
-                return {"instanceView": {"statuses": [{"code": "PowerState/deallocated"}]}}
-            if args[:2] == ("resource", "list"):
-                return []
-            if args[:4] == ("network", "vnet", "subnet", "show"):
-                return {"networkSecurityGroup": {
-                    "id": base + "networkSecurityGroups/" + self.config["networkSecurityGroup"]}}
-            if args[:3] == ("network", "nic", "show"):
-                return copy.deepcopy(nic)
-            if args[:3] == ("network", "nic", "update"):
-                nic["networkSecurityGroup"] = {"id": args[-1]}
-            elif args[:3] == ("network", "public-ip", "show"):
-                return public
-            elif args[:4] == ("network", "nic", "ip-config", "update"):
-                nic["ipConfigurations"][0]["publicIPAddress"] = {"id": public["id"]}
-            elif args[:3] != ("network", "public-ip", "create"):
-                self.fail("Unexpected Azure call")
-        with patch.object(self.engine, "owned_group"), patch.object(self.engine, "vm", return_value=model), \
-                patch.object(self.engine, "check_reference_model"), patch.object(self.engine, "rest", side_effect=rest), \
-                patch.object(self.engine, "az", side_effect=azure):
-            self.engine.enable_reference_ssh()
-        self.assertEqual(len(puts), 2)
-        self.assertTrue(all(ident.startswith(deploy.base_id(self.config) + "/") for ident in puts))
-        self.assertEqual(deploy.read_json(self.engine.evidence / "reference-ssh.json")["address"], "203.0.113.24")
-        with patch.object(self.engine, "owned_group"), patch.object(self.engine, "vm", return_value=model), \
-                patch.object(self.engine, "check_reference_model"), patch.object(self.engine, "az", return_value={
-                    "instanceView": {"statuses": [{"code": "PowerState/running"}]}}), \
-                patch.object(self.engine, "rest") as request, \
-                self.assertRaisesRegex(deploy.DeploymentError, "deallocated"):
-            self.engine.enable_reference_ssh()
-        request.assert_not_called()
+            if args[:2] == ("vm", "list") or args[:2] == ("resource", "list"):
+                return [self.model()]
+            self.fail("Unexpected cleanup action: " + repr(args[:3]))
+        with patch.object(self.engine, "owned_group"), patch.object(self.engine, "acceptance_gate"), \
+                patch.object(self.engine, "vm", return_value=self.model()), \
+                patch.object(self.engine, "check_reference_model"), \
+                patch.object(self.engine, "deallocate") as deallocate, \
+                patch.object(self.engine, "az", side_effect=azure) as commands, \
+                patch.object(self.engine, "rest", side_effect=AssertionError("Network mutation attempted")):
+            self.engine.cleanup()
+        deallocate.assert_called_once_with("reference")
+        self.assertFalse(any(call.args[0] == "network" for call in commands.call_args_list))
+        summary = deploy.read_json(self.engine.evidence / "cleanup-summary.json")
+        self.assertTrue(summary["referenceDeallocated"])
+        self.assertEqual(summary["referenceVm"], self.config["referenceVm"])
+        self.assertEqual(summary["resourceGroup"], self.config["resourceGroup"])
+        self.assertEqual(summary["sshAccess"], "USER_CONFIRMATION_REQUIRED")
 
 
 class EvidenceTests(Fixture):

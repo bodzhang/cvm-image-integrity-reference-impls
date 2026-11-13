@@ -116,33 +116,33 @@ through Managed Run Command. Installed collector hashes/provenance are checked,
 but the SDK is **not run** and no MAA token is collected; the result records
 `NOT_RUN` / `DEFERRED_TO_SSH`. After success, the reference remains deallocated.
 
-To retain a corporate-accessible SSH endpoint after successful acceptance, add:
+### User-driven SSH and SDK testing
 
-```bash
-  --reference-network-template-nic-id \
-    '/subscriptions/<your-subscription-guid>/resourceGroups/<approved-group>/providers/Microsoft.Network/networkInterfaces/<approved-reference-NIC>'
-```
+The controller retains the reference **deallocated and private-only**. Its
+completion message identifies the resource group/VM and asks you to confirm or
+reconfigure approved network access before SSH testing. The cleanup summary
+records `sshAccess: USER_CONFIRMATION_REQUIRED`; this is not a successful SSH
+connectivity check.
 
-This is explicit approval to copy that NIC's **configured NIC and subnet NSG
-rules**, including corporate source tags/CIDRs. It does not copy its IP address,
-reuse or modify its resources, or expand service tags into hard-coded IP lists.
-The source must have a static Standard IPv4 public IP and both NSGs.
-Unrestricted Internet SSH and application-security-group references are rejected.
-Both rule sets are captured privately and their copies are read back exactly.
-Only after acceptance, builder deletion and reference deallocation are the
-copied rules applied to the new run's subnet/reference NSGs and a new static
-public IP attached to the reference NIC. The builder never receives a public IP.
-Without this option, the reference remains private-only.
-
-Start the retained reference when needed, authenticate its current host key
-through Azure boot diagnostics, then use your private login key to SSH and run
-the installed collector. The endpoint and host-key instructions are recorded in
-private `evidence/reference-ssh.json`. Each reboot regenerates the host key.
+1. Inspect the retained VM's NIC/subnet NSGs, applicable corporate policies and
+   routing. Confirm an approved private route, VPN or jump host. If public SSH is
+   appropriate, configure its public endpoint and corporate-only source rules
+   yourself under your organization's policy; never allow unrestricted Internet
+   SSH.
+2. Do not assume subscription defaults provide the required access. Check the
+   effective rules on both NIC and subnet, including any higher-priority deny.
+   The controller neither copies another VM's NSGs nor attaches a public VM IP
+   or changes networking after acceptance.
+3. Start the reference when needed. Authenticate its current host key through
+   Azure boot diagnostics, then use your private login key to SSH and run the
+   installed collector against your approved MAA endpoint. Each reboot
+   regenerates the host key; never blindly accept a replacement.
+4. Deallocate the reference again after manual testing to avoid compute charges.
 
 To preserve the earlier end-to-end SSH acceptance/SDK-collection workflow,
 select `--validation-transport ssh` and supply `--ssh-private-key`,
 `--ssh-source-cidr` and `--maa-endpoint`. That mode still requires private routing
-during acceptance; post-test public SSH does not establish that route.
+during acceptance; the later user-driven network handoff does not establish that route.
 If the approved private route is through an existing SSH jump host, also add:
 
 ```bash
@@ -168,8 +168,7 @@ create peering or change an existing jump host's ingress rules.
 
 Remove `-Plan` to execute. The PowerShell entry point requires the same Python
 engine, not Git Bash, and has the same lifecycle and validation boundaries.
-`-ValidationTransport managed` is the default; `-ReferenceNetworkTemplateNicId`
-selects the same opt-in corporate SSH template. `-ValidationTransport ssh`
+`-ValidationTransport managed` is the default. `-ValidationTransport ssh`
 requires `-SshPrivateKey`, `-SshSourceCidr` and `-MaaEndpoint`.
 `-NetworkAddressPrefix`, `-SubnetPrefix` and `-BuilderImage` match the corresponding
 Bash options. `-SshJumpHost` and `-SshJumpKnownHosts` provide the same opt-in
@@ -203,7 +202,8 @@ placeholders even when previewing.
     optional SSH-validation mode perform the installed-collector MAA collection.
 11. Remove ownership-checked temporary build/upload resources and retain the
     Gallery image plus the **deallocated** reference CVM and local evidence.
-    Apply an explicitly selected corporate SSH network template only afterward.
+    Provide a user-driven SSH/network-configuration handoff without changing
+    the retained VM's networking.
 
 In optional SSH-validation mode, authenticate the SSH host key through Azure
 boot diagnostics. Stage the verifier and independent inputs; check firmware
