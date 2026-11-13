@@ -52,6 +52,45 @@ Never substitute the builder kernel or silently select a newer Marketplace
 version. Source provenance, layout, signed modules, original kernel, signed
 UKI sections and fixed-VHD checks are build gates.
 
+## Testing components and production hardening
+
+This is a build/boot and attestation **test reference, not a production-hardened
+image**. It preserves cloud-init, the Azure Linux Guest Agent, SSH and inherited
+Ubuntu update facilities for provisioning, compatibility and testing. Their
+presence is not a recommendation to retain these management paths in production.
+
+dm-verity protects the lower filesystem, not all runtime behavior. Privileged
+cloud-init modules, guest extensions or SSH sessions can execute code and shadow
+verified files through the writable tmpfs upper without changing the lower
+disk. Passing root-policy checks or collecting a MAA token does not demonstrate
+that these runtime management paths are hardened.
+
+Before using a derivative image in production, define and validate a hardening
+policy appropriate to the workload. Examples include:
+
+| Component | Purpose in this test reference | Production hardening |
+| --- | --- | --- |
+| cloud-init | Azure metadata/network setup, deployment-supplied username/public key and the controller's custom-data SSH host-key publication | Restrict modules and user-data processing, following the [Azure sample's restricted cloud-init policy](https://github.com/Azure/AzureStack-Tools/blob/master/ConfidentialComputing/CvmImageBuilder/rootfs-files/cloud-init-hardened.yaml) as a starting point. Block arbitrary user/vendor-data execution and retain only required provisioning/metadata behavior. |
+| Azure Linux Guest Agent (`waagent`/`walinuxagent`) | Managed Run Command, VM extensions and platform integration used during testing | Remove the guest agent from the production image when these management features are not required. Review provisioning and platform-reporting implications; Managed Run Command and agent-based extensions will no longer be available. This agent is distinct from the installed attestation collector. |
+| OpenSSH server | Interactive diagnostics, SSH acceptance and manual collector execution | Disable SSH, including both `ssh.service` and socket activation through `ssh.socket`; remove the server if unnecessary and close inbound SSH access. Use an explicitly designed production attestation/operations path instead. |
+| Ubuntu automatic updates | Inherited Marketplace facilities; this recipe does not establish a hardened update policy | Disable automatic APT/unattended upgrades, including `apt-daily.timer` and `apt-daily-upgrade.timer`, and review any other retained automatic updaters. Deliver security fixes through controlled image rebuilds and redeployment instead. |
+
+Do not copy the sample's cloud-init configuration unchanged while expecting this
+reference's deployment workflow to keep working: the sample disables runtime
+user creation, whereas this controller supplies the login username/key through
+Azure provisioning and uses a cloud-init `bootcmd` for host-key publication.
+A hardened derivative must replace or deliberately retain those specific
+provisioning functions and verify that untrusted input cannot re-enable excluded
+behavior.
+
+Apply production changes **during image construction, before verity generation
+and UKI signing**, then rebuild, publish and qualify the resulting image and its
+expected measurements. Runtime changes to this test VM disappear at reboot.
+The existing managed/SSH acceptance paths intentionally depend on the retained
+test components; production images without them need an alternative validation
+and attestation path, not silently skipped checks. These examples are not a
+complete production security baseline.
+
 ## Choose where to build
 
 | Workflow | Image preparation | Azure VMs |
