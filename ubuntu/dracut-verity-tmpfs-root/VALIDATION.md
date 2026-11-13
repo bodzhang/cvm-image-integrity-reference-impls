@@ -17,7 +17,7 @@
 | Visible volatile-overlay backing | **Passed on the builder and actual CVM**: bind-mounted read-only lower, retained tmpfs upper/work, required initrd guard and runtime guard passed, including after a real reboot |
 | Azure signer enrollment / CVM boot | Gallery 1.0.3 replication and exact custom signer/Microsoft template readback passed; `VMGuestStateOnly` booted with Secure Boot enabled and the independently expected signer present in actual firmware db. Initial and corrected-image `NonPersistedTPM` attempts reported Compute `SecureBootClientError` |
 | First boot / workload / real reboot | **Passed**: full verity verification and firmware/kernel/hash/device/agent checks on both boots; 136 MiB and 2,051 measured tmpfs inodes; distinct reboot ID and entire workload absent |
-| Actual PCR-11 quote / MAA flow | Installed SDK attempted real MAA attestation and failed on omitted systemd phase events; genuine combined replay matches actual PCR 11. Tmpfs-only supplemented-log/expanded-PCR diagnostic then reached a `dbvalidated=false` policy denial. **No token issued or remote expected-UKI verification established** |
+| Actual PCR-11 quote / MAA flow | Installed SDK failed on omitted systemd phase events; genuine combined replay matches actual PCR 11. Tmpfs-only supplemented-log diagnostic obtained a real custom-policy MAA token: signature/issuer/lifetime and signed raw values verified for `0-8,11`. PCR 12 was requested but omitted from token coverage. **Installed collector and independent expected-UKI verification remain unqualified** |
 
 These tests are not simulated evidence of Azure firmware behavior. A UKI with
 a synthetic kernel payload proves packaging/signature/section binding only.
@@ -99,7 +99,7 @@ verifier now explicitly checks JSON status and fatal-error arrays, reports and
 retains recoverable warnings, and rejects incomplete or failed provisioning.
 The full post-reboot recheck passed without rebuilding the VHD.
 
-## Actual MAA investigation: no successful token
+## Shared-endpoint MAA investigation: no successful token
 
 The installed pinned SDK submitted genuine CVM evidence to
 `https://sharedwus3.wus3.attest.azure.net`. Its initial request quoted SHA-256
@@ -135,6 +135,12 @@ With PCRs `0,2,4,7,11`, the error advanced to `PcrQuoteHashDoesNotMatch`:
 [type=="x-ms-azurevm-dbvalidated", value==false] => deny();
 ```
 
+A further real SDK test selected exactly `0,1,2,3,4,5,6,7,8,11,12`,
+using a fresh relying-party challenge and the same genuine supplemented log.
+It received the same HTTP 400 `PolicyValidationFailure` / `dbvalidated=false`
+denial, with no PCR-log or missing-PCR error reported. Adding PCRs 8 and 12 did
+not change the observed policy blocker; no token was issued.
+
 This demonstrates a further provider-policy rejection, distinct from firmware
 Secure Boot acceptance and the earlier event-log/quote errors. It does not
 prove successful token issuance, a general custom-key attestation prohibition,
@@ -142,6 +148,47 @@ or an independently authenticated expected-UKI result. No provider policy was
 changed, Secure Boot disabled, PCR 11 omitted or synthetic evidence substituted.
 The installed collector still uses its original firmware-only input and exact
 PCR set; these tmpfs diagnostics are not an integrated SDK fix.
+
+## Custom-policy endpoint: real token issued
+
+A dedicated AAD-trust provider in westus3 was created for this test. Its actual
+default `AzureGuest` policy matched the shared provider's retrieved policy.
+Only the `[type=="x-ms-azurevm-dbvalidated", value==false] => deny();` rule was
+removed. Default-key, debugger, Secure Boot, signing and dbx checks were kept.
+Authenticated policy management used API `2025-06-01`; exact policy readback
+matched the submitted bytes, SHA-256
+`e573d47b3db3f9ce237ee4fa61a74cbf14523b19d6c0d63b8687b9a441c73409`.
+
+The unchanged SDK, in the same private tmpfs mount-namespace diagnostic, used a
+fresh relying-party challenge, genuine supplemented event log and PCR selection
+`0,1,2,3,4,5,6,7,8,11,12`. The provider issued a real token. Its RS256 signature
+was verified against keys obtained over HTTPS from that provider's discovered
+JWKS endpoint; expected issuer and current validity interval were checked.
+The signed token reports:
+
+- `secureboot=true`, `x-ms-azurevm-dbvalidated=false`;
+- default-key, debugger, signing and dbx validation claims remain true;
+- `x-ms-azurevm-attested-pcrs` covers `0,1,2,3,4,5,6,7,8,11`;
+- `x-ms-azurevm-attested-pcr-values` contains raw base64 SHA-256 digests for
+  those PCRs, including PCR 7 and PCR 11; all match the submitted request.
+
+PCR 12 is present in the submitted PCR set and values, with an all-zero digest,
+but is **absent from the signed coverage/value claims**. Do not claim complete
+coverage of the requested set or infer that a zero PCR alone explains omission:
+the token includes PCR 8 with a zero value.
+
+The signed PCR 11 value matches the independently replayed genuine measurements
+above. The submitted event-log SHA-256 matches the diagnostic's exact normalized
+bytes. Full SDK response and stderr were retrieved with independent SHA-256
+checks and retained privately. No raw token or VM-identifying evidence is
+published here. The custom endpoint and working Gallery image are explicitly
+retained per the test owner's instruction.
+
+This is successful custom-policy token issuance, not proof that the installed
+collector works without supplementation. Removing default db validation does
+not pin our custom signer or expected UKI. Independent AK/quote/TEE and challenge
+binding and full expected-UKI identity checks are not implemented by this
+diagnostic; no production-complete remote image verifier is claimed.
 
 A further publication experiment explicitly set
 `publishingProfile.targetRegions[].encryption.osDiskImage.securityProfile.confidentialVMEncryptionType`
@@ -184,8 +231,10 @@ accept a successful PUT or an old execution result as evidence of a new command.
    explicit approved MAA endpoint. Retain the quote, PCR values, TEE evidence,
    event log and returned token. Require independent verification of token,
    AK/quote/TEE binding, freshness and expected full UKI measurements before
-   calling the expected root hash attested. A PCR-11 coverage claim is not the
-   PCR-11 digest; user-data binds the TEE report, not quote `extraData`.
+   calling the expected root hash attested. A PCR-11 coverage index is not its
+   digest; the observed signed `x-ms-azurevm-attested-pcr-values` claim provides
+   raw values only for the listed PCRs. User-data binds the TEE report, not
+   quote `extraData`.
 
 No production-complete root-hash attestation, rollback protection, immutable
 effective-root executable policy, OS-disk encryption or general CVM-family

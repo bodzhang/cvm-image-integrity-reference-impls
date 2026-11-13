@@ -11,8 +11,10 @@ volatile; the verified ext4 lower never has a writable fallback.
 
 **Status: experimental. Complete Marketplace conversion, custom-signed UKI
 boot and first-boot/real-reboot acceptance passed on an Azure Intel TDX CVM
-using `VMGuestStateOnly`. Stateless boot and successful MAA token issuance
-remain unqualified.** See [the observed evidence and limits](VALIDATION.md).
+using `VMGuestStateOnly`. A tmpfs-only SDK diagnostic also obtained a
+signature-verified token from a custom-policy MAA endpoint. Stateless boot and
+the installed firmware-only collector remain unqualified.**
+See [the observed evidence and limits](VALIDATION.md).
 Do not claim production integrity or remote image verification from these tests.
 
 ## Inputs and boundaries
@@ -307,7 +309,9 @@ omitting genuine systemd boot-phase extensions into PCR 11. The tested shared
 West US 3 MAA endpoint rejects this with `PcrDoesNotMatchTcg`. A tmpfs-only
 diagnostic appended genuine recorded phase events and quoted PCRs `0-7,11`;
 the error advanced to a policy denial of `x-ms-azurevm-dbvalidated=false`.
-No token was issued. The diagnostic does not change the installed collector
+No token was issued by that shared endpoint. A separately owned endpoint,
+removing only the dbvalidated denial, subsequently issued a real token for the
+expanded diagnostic. The diagnostic does not change the installed collector
 or qualify its default PCR set. See [the attestation investigation](VALIDATION.md).
 
 ```bash
@@ -357,9 +361,12 @@ them or receiving a token**.
 
 [Microsoft's guest-attestation documentation](https://learn.microsoft.com/en-us/azure/confidential-computing/guest-attestation-confidential-vms#json-web-token)
 shows `11` in the signed token's `x-ms-azurevm-attested-pcrs` list. This is evidence
-that MAA can attest PCR-11 coverage, **not a documented raw PCR-11 digest claim**.
-That example is for Windows; acceptance of this Linux/systemd UKI evidence and
-the exact returned claim set still require a real test against your endpoint.
+that MAA can attest PCR-11 coverage; the index list is not a digest.
+That example is for Windows. Our actual Linux/TDX token additionally contains
+`x-ms-azurevm-attested-pcr-values`, mapping names such as `pcr7` and `pcr11` to
+base64 SHA-256 values. Its signature was verified and its reported values
+matched the submitted evidence. The diagnostic requested `0-8,11,12`, but
+the token covers only `0-8,11`: PCR 12 must not be claimed as attested.
 Do not assume arbitrary custom claim emission or a particular provider policy.
 
 An independent relying party must:
@@ -385,6 +392,34 @@ This change integrates **evidence collection and MAA-flow testing**, not a
 production remote verifier or an automatic claim that the expected root
 filesystem was attested. An endpoint rejecting custom Secure Boot keys or UKI
 event logs is a qualification failure, not a reason to remove PCR 11.
+
+### Dedicated custom-db test endpoint
+
+Use a separately owned MAA provider when testing a custom firmware db. Do not
+change a shared regional provider. The `AzureGuest` policy-management REST API
+supports this type in API version `2025-06-01`; older CLI documentation does not
+necessarily list it. An AAD-trust provider requires authenticated policy
+management with the `https://attest.azure.net` resource.
+
+Retrieve and retain the provider's actual default policy before modifying it.
+The test policy removes only:
+
+```text
+[type=="x-ms-azurevm-dbvalidated", value==false] => deny();
+```
+
+Keep the default Secure Boot, default-key, debugger, signing and dbx denial
+rules unchanged. Read back the published policy and compare its exact contents
+before attesting. Never replace a failed validation claim with `true`.
+
+This relaxation allows a token despite failed default db validation; it does
+**not** pin the custom certificate or expected image. A relying party still
+needs independently authenticated expected signer/UKI measurements and the
+quote/TEE/freshness checks above. Keep genuine systemd userspace events in the
+attestation evidence; changing policy does not repair a PCR/event-log mismatch.
+The tested expanded diagnostic requests PCRs `0,1,2,3,4,5,6,7,8,11,12`.
+Neither this policy nor the tmpfs SDK diagnostic changes the installed
+collector's firmware-only input or its original exact PCR set.
 
 ## Threat model and limits
 
