@@ -6,6 +6,7 @@ Run Command is used only on the disposable builder, never for guest acceptance.
 """
 
 import argparse
+import ast
 import base64
 import hashlib
 import importlib.util
@@ -95,6 +96,25 @@ def validate_endpoint(value):
             "Supply an approved explicit HTTPS AzureGuest MAA endpoint without credentials/query")
 
 
+def ssh_path(value):
+    path = Path(value).as_posix()
+    require(not any(character in path for character in "\r\n"), "SSH paths cannot contain newlines")
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def jump_configuration(config, private_key):
+    user, host = config["sshJumpHost"].split("@")
+    return "\n".join((
+        "Host cvm-dracut-jump", "  HostName " + host, "  User " + user,
+        "  IdentityFile " + ssh_path(private_key),
+        "  UserKnownHostsFile " + ssh_path(config["sshJumpKnownHosts"]),
+        "  GlobalKnownHostsFile " + ssh_path(Path(config["runDirectory"]) / "empty-global-known-hosts"),
+        "  IdentitiesOnly yes", "  BatchMode yes", "  StrictHostKeyChecking yes",
+        "  UpdateHostKeys no", "  ForwardAgent no", "  ClearAllForwardings yes",
+        "  HostKeyAlgorithms ssh-ed25519", "  ConnectTimeout 15", "  ConnectionAttempts 1", "",
+    ))
+
+
 def configuration(args):
     require(re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
                          args.subscription_id), "Subscription must be a GUID")
@@ -110,6 +130,12 @@ def configuration(args):
     require(bool(args.ssh_public_key.strip()), "SSH public key path must not be empty")
     if args.maa_endpoint:
         validate_endpoint(args.maa_endpoint)
+    require(bool(args.ssh_jump_host) == bool(args.ssh_jump_known_hosts),
+            "Supply both --ssh-jump-host and --ssh-jump-known-hosts")
+    if args.ssh_jump_host:
+        require(re.fullmatch(r"[a-z_][a-zA-Z0-9_-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*",
+                             args.ssh_jump_host),
+                "SSH jump host must be user@hostname without options or whitespace")
     net = ipaddress.ip_network(args.network_address_prefix)
     subnet = ipaddress.ip_network(args.subnet_prefix)
     private_ranges = [ipaddress.ip_network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
@@ -139,6 +165,9 @@ def configuration(args):
         "imageDefinition": "ubuntu2404-dracut-verity", "imageVersion": "1.0.0",
         "runDirectory": str(run), "sshPublicKey": str(key_path),
         "maaEndpoint": args.maa_endpoint,
+        "sshJumpHost": args.ssh_jump_host,
+        "sshJumpKnownHosts": str(Path(args.ssh_jump_known_hosts).expanduser().resolve())
+        if args.ssh_jump_known_hosts else None,
         "privateConnectivity": "Controller must already have an approved route to the new private subnet; no inbound public IP",
         "attestationVerification": "NOT_VERIFIED: collection only; PCR12 token coverage may be absent",
     }
@@ -168,6 +197,14 @@ def azure_executable():
                 "Cannot locate Azure CLI's bundled python.exe beside az.cmd; use the official Azure CLI MSI")
         return [str(cli_python), "-IBm", "azure.cli"]
     return [executable]
+
+
+def azure_body_path(path):
+    launcher = Path(shutil.which("az") or "az")
+    if os.name != "nt" and (launcher.parent.parent / "python.exe").is_file():
+        require(shutil.which("wslpath"), "WSL Windows Azure CLI requires wslpath for large request files")
+        return command(["wslpath", "-w", str(path)]).stdout.decode().strip()
+    return str(path)
 
 
 def validate_public_key(path):
@@ -312,9 +349,23 @@ class Engine:
 
     def az(self, *args, timeout=300, raw=False):
         result = command([*azure_executable(), *args, "--subscription", self.c["subscriptionId"],
-                          "--only-show-errors", "--output", "tsv" if raw else "json"], timeout=timeout)
+                          "--only-show-errors", "--output", "tsv" if raw else "json"],
+                         timeout=timeout, check=False)
+        if result.returncode:
+            self.sequence += 1
+            diagnostic = self.evidence / f"azure-{self.sequence:03d}.stderr"
+            private_write(diagnostic, result.stderr)
+            private_write(diagnostic.with_suffix(".stdout"), result.stdout)
+            raise DeploymentError(f"Azure operation failed (exit {result.returncode}); see private evidence {diagnostic.name}")
         if raw:
-            return result.stdout.decode()
+            output = result.stdout
+            if output.startswith((b"b'", b'b"')):
+                try:
+                    output = ast.literal_eval(output.decode("ascii").strip())
+                except (ValueError, SyntaxError, UnicodeDecodeError) as error:
+                    raise DeploymentError("Azure returned malformed byte-literal text") from error
+                require(isinstance(output, bytes), "Azure returned unexpected byte-literal text")
+            return output.decode(errors="surrogateescape")
         try:
             return json.loads(result.stdout) if result.stdout.strip() else None
         except ValueError as error:
@@ -344,9 +395,13 @@ class Engine:
         if expand:
             args += ["--url-parameters", "$expand=" + expand]
         if body is not None:
-            # Inline JSON works with both az and az.cmd; @body paths do not
-            # reliably survive the Windows CLI's second argument parser.
-            args += ["--body", json.dumps(body, separators=(",", ":")),
+            payload = json.dumps(body, separators=(",", ":"))
+            # Recipe staging exceeds native Windows/WSL command-line limits.
+            if len(payload.encode()) > 8192:
+                path = self.evidence / ("azure-request-" + uuid.uuid4().hex + ".json")
+                private_write(path, payload)
+                payload = "@" + azure_body_path(path)
+            args += ["--body", payload,
                      "--headers", "Content-Type=application/json"]
         return self.az(*args)
 
@@ -388,8 +443,13 @@ class Engine:
             needs["cores"] += cpus
         for family, cpus in needs.items():
             matches = [item for item in usages if item["name"]["value"].lower() == family]
-            require(len(matches) == 1 and matches[0]["limit"] - matches[0]["currentValue"] >= cpus,
-                    "Insufficient regional/family VM quota")
+            require(len(matches) == 1, "Missing or duplicate VM quota family: " + family)
+            values = [matches[0][field] for field in ("limit", "currentValue")]
+            require(all((type(value) is int and value >= 0)
+                        or (isinstance(value, str) and re.fullmatch(r"[0-9]+", value))
+                        for value in values), "Invalid VM quota values: " + family)
+            require(int(values[0]) - int(values[1]) >= cpus,
+                    "Insufficient regional/family VM quota: " + family)
         self.record("quota-preflight", {"needs": needs})
 
     def network(self):
@@ -423,8 +483,8 @@ class Engine:
         # Bootcmd runs again when the volatile root is recreated. Key material
         # comes from authenticated boot diagnostics, never ssh-keyscan.
         code = ("(while ! test -s /etc/ssh/ssh_host_ed25519_key.pub; do sleep 1; done; "
-                "printf '\\nCVM_SSH_BOOT_BEGIN '; cat /proc/sys/kernel/random/boot_id; "
-                "cat /etc/ssh/ssh_host_ed25519_key.pub; printf 'CVM_SSH_BOOT_END\\n') "
+                "printf '\\nCVM_SSH_BOOT_BEGIN %s\\n%s\\nCVM_SSH_BOOT_END\\n' "
+                '"$(cat /proc/sys/kernel/random/boot_id)" "$(cat /etc/ssh/ssh_host_ed25519_key.pub)") '
                 "> /dev/ttyS0 2>&1 &")
         return "#cloud-config\nbootcmd:\n  - " + json.dumps(["bash", "-c", code]) + "\n"
 
@@ -546,15 +606,18 @@ class Engine:
             log = self.az("vm", "boot-diagnostics", "get-boot-log", "-g", self.c["resourceGroup"],
                           "-n", self.c[role + "Vm"], raw=True)
             matches = re.findall(
-                r"CVM_SSH_BOOT_BEGIN\s+([0-9a-f-]{36})\s+"
-                r"(ssh-ed25519 [A-Za-z0-9+/]+=*(?: [^\r\n]*)?)\s+CVM_SSH_BOOT_END", log)
+                r"^CVM_SSH_BOOT_BEGIN ([0-9a-f-]{36})\r?\n(.*?)^CVM_SSH_BOOT_END\r?$",
+                log, re.MULTILINE | re.DOTALL)
             if not matches:
                 return {}
-            boot, key = matches[-1]
+            boot, block = matches[-1]
+            require("CVM_SSH_BOOT_BEGIN" not in block, "Nested SSH boot-key publication")
+            keys = re.findall(r"^ssh-ed25519 ([A-Za-z0-9+/]+=*)(?: [^\r\n]*)?\r?$", block, re.MULTILINE)
+            require(len(keys) == 1, "SSH boot-key publication must contain exactly one ED25519 key")
             boot = str(uuid.UUID(boot))
             if previous and boot == previous:
                 return {}
-            return {"bootId": boot, "hostKey": " ".join(key.split()[:2])}
+            return {"bootId": boot, "hostKey": "ssh-ed25519 " + keys[0]}
         record = self.poll(fetch, bool, "Authenticated Azure boot host-key publication", timeout=900)
         if previous:
             require(record["hostKey"] != self.hosts[role]["hostKey"],
@@ -581,15 +644,20 @@ class Engine:
 
     def ssh(self, role, remote, data=None, check=True, timeout=1800):
         host = self.hosts[role]
-        args = ["ssh", "-F", "none", "-i", self.key, "-o", "IdentitiesOnly=yes",
+        config = self.run / "ssh-jump.config" if self.c.get("sshJumpHost") else None
+        if config:
+            require(config.is_file(), "Missing independently authenticated SSH jump configuration")
+        args = ["ssh", "-F", str(config) if config else "none", "-i", self.key, "-o", "IdentitiesOnly=yes",
                 "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                "-o", "UserKnownHostsFile=" + host["knownHosts"],
-                "-o", "GlobalKnownHostsFile=" + str(self.run / "empty-global-known-hosts"),
+                "-o", "UserKnownHostsFile=" + ssh_path(host["knownHosts"]),
+                "-o", "GlobalKnownHostsFile=" + ssh_path(self.run / "empty-global-known-hosts"),
                 "-o", "HostKeyAlias=" + host["alias"], "-o", "HostKeyAlgorithms=ssh-ed25519",
                 "-o", "UpdateHostKeys=no", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes",
                 "-o", "CheckHostIP=no", "-o", "ConnectTimeout=15", "-o", "ConnectionAttempts=1",
-                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=6",
-                self.c["adminUsername"] + "@" + host["address"], remote]
+                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=6"]
+        if config:
+            args += ["-J", "cvm-dracut-jump"]
+        args += [self.c["adminUsername"] + "@" + host["address"], remote]
         result = command(args, data=data, timeout=timeout, check=False)
         self.sequence += 1
         private_write(self.evidence / f"ssh-{self.sequence:03d}.stderr", result.stderr)
@@ -1016,6 +1084,8 @@ def parser():
     deploy.add_argument("--run-directory")
     deploy.add_argument("--maa-endpoint")
     deploy.add_argument("--ssh-source-cidr", help="Approved corporate RFC1918 source; controller must have private routing")
+    deploy.add_argument("--ssh-jump-host", help="Optional user@host on an existing approved SSH path; uses the same private key")
+    deploy.add_argument("--ssh-jump-known-hosts", help="Independently authenticated ED25519 known-hosts file for --ssh-jump-host")
     deploy.add_argument("--network-address-prefix", default="10.73.0.0/24")
     deploy.add_argument("--subnet-prefix", default="10.73.0.0/26")
     deploy.add_argument("--builder-image", default=BUILDER_IMAGE, help="Pinned standard Ubuntu 24.04 server URN")
@@ -1042,6 +1112,11 @@ def main(argv=None):
             require(shutil.which(tool), "Missing required tool: " + tool)
         private = Path(args.ssh_private_key).expanduser().resolve()
         require(private.is_file(), "SSH private key file does not exist")
+        if config["sshJumpHost"]:
+            known = Path(config["sshJumpKnownHosts"])
+            require(known.is_file(), "SSH jump known-hosts file does not exist")
+            host = config["sshJumpHost"].split("@")[1]
+            command(["ssh-keygen", "-F", host, "-f", known])
         if os.name != "nt":
             require(private.stat().st_mode & 0o077 == 0, "SSH private key must have mode 0600 or stricter")
         private_fingerprint = command(["ssh-keygen", "-lf", private]).stdout.decode().split()
@@ -1055,6 +1130,8 @@ def main(argv=None):
         (run / "evidence").mkdir(mode=0o700)
         write_json(run / "config.json", config)
         private_write(run / "empty-global-known-hosts", "")
+        if config["sshJumpHost"]:
+            private_write(run / "ssh-jump.config", jump_configuration(config, private))
         if os.name == "nt":
             print("WARNING: Windows ACLs are inherited; the run directory's parent must already be restricted to the operator. POSIX modes do not enforce Windows ACLs.", file=sys.stderr)
         Engine(config, str(private)).deploy()

@@ -170,6 +170,45 @@ class PlanningTests(Fixture):
 
 
 class AzureBoundaryTests(Fixture):
+    def test_azure_failure_preserves_private_diagnostics_without_printing_credentials(self):
+        error = b"Authorization Bearer fake-token SAS=fake-secret"
+        with patch.object(deploy, "command", return_value=subprocess.CompletedProcess(
+                [], 1, b"private response", error)), self.assertRaises(deploy.DeploymentError) as raised:
+            self.engine.az("rest", "--method", "get")
+        self.assertNotIn("fake-token", str(raised.exception))
+        diagnostic = self.engine.evidence / "azure-001.stderr"
+        self.assertEqual(diagnostic.read_bytes(), error)
+        self.assertEqual(diagnostic.with_suffix(".stdout").read_bytes(), b"private response")
+        if os.name != "nt":
+            self.assertEqual(diagnostic.stat().st_mode & 0o777, 0o600)
+
+    def test_large_recipe_request_uses_private_file_instead_of_oversized_native_arguments(self):
+        body = {"properties": {"source": {"script": "echo retained-recipe\n" * 2500}}}
+        with patch.object(self.engine, "az", return_value={}) as azure, \
+                patch.object(deploy, "azure_body_path", side_effect=str):
+            self.engine.rest("put", self.model("builder")["id"], body)
+        arguments = azure.call_args.args
+        value = arguments[arguments.index("--body") + 1]
+        self.assertTrue(value.startswith("@"))
+        path = Path(value[1:])
+        self.assertEqual(path.parent, self.engine.evidence)
+        self.assertEqual(json.loads(path.read_text()), body)
+        self.assertLess(len(subprocess.list2cmdline(list(arguments))), 8192)
+        if os.name != "nt":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_wsl_request_file_is_translated_for_bundled_windows_azure_cli(self):
+        path = self.workspace / "request with spaces.json"
+        with patch.object(deploy.os, "name", "posix"), patch.object(deploy, "Path", type(self.workspace)), \
+                patch.object(deploy.shutil, "which", side_effect=lambda name: {
+                    "az": "/mnt/c/Azure/CLI2/wbin/az", "wslpath": "/usr/bin/wslpath"}[name]), \
+                patch.object(Path, "is_file", return_value=True), \
+                patch.object(deploy, "command", return_value=subprocess.CompletedProcess(
+                    [], 0, b"\\\\wsl.localhost\\Ubuntu\\private\\request with spaces.json\n", b"")) as process:
+            value = deploy.azure_body_path(path)
+        self.assertEqual(value, r"\\wsl.localhost\Ubuntu\private\request with spaces.json")
+        self.assertEqual(process.call_args.args[0], ["wslpath", "-w", str(path)])
+
     def test_windows_azure_cli_bypasses_batch_reparsing(self):
         with patch.object(deploy.os, "name", "nt"), patch.object(deploy, "Path", type(self.workspace)), \
                 patch.object(deploy.shutil, "which", return_value="C:/Azure/CLI2/wbin/az.cmd"), \
@@ -228,6 +267,34 @@ class AzureBoundaryTests(Fixture):
                 self.assertRaisesRegex(deploy.DeploymentError, "new and dedicated"):
             self.engine.preflight()
         self.assertEqual(azure.call_count, 1)
+
+    def test_preflight_accepts_azure_cli_string_quotas_and_rejects_bad_or_insufficient_values(self):
+        for limit, current, accepted in (
+            ("24", "12", True), (24, 12, True), ("24", "13", False),
+            ("unknown", "0", False), (True, 0, False), (24, -1, False),
+        ):
+            def azure(*args):
+                if args[:2] == ("group", "exists"):
+                    return False
+                if args[:2] == ("vm", "image"):
+                    return {}
+                if args[:2] == ("vm", "list-usage"):
+                    return [{"name": {"value": family}, "limit": limit, "currentValue": current}
+                            for family in ("cores", "builder-family", "reference-family")]
+                if args[:2] == ("vm", "list-skus"):
+                    size = args[args.index("--size") + 1]
+                    builder = size == self.config["builderVmSize"]
+                    return [{"name": size, "family": "builder-family" if builder else "reference-family",
+                             "restrictions": [], "capabilities": [
+                                 {"name": "vCPUs", "value": "8" if builder else "4"}]}]
+                self.fail("Unexpected Azure call")
+            with self.subTest(limit=limit, current=current), patch.object(
+                    self.engine, "az", side_effect=azure):
+                if accepted:
+                    self.engine.preflight()
+                else:
+                    with self.assertRaises(deploy.DeploymentError):
+                        self.engine.preflight()
 
     def test_poll_rejects_terminal_managed_or_replication_failures(self):
         for value in ({"properties": {"provisioningState": "Failed"}},
@@ -342,6 +409,31 @@ class SSHTests(Fixture):
     def serial(self, boot, key):
         return "CVM_SSH_BOOT_BEGIN " + boot + "\nssh-ed25519 " + key + " root@guest\nCVM_SSH_BOOT_END\n"
 
+    def test_binary_serial_with_interleaved_service_logs_preserves_authenticated_host_key(self):
+        key = base64.b64encode(b"a" * 64).decode()
+        serial = self.serial(self.boot1, key).replace(
+            "\nssh-ed25519", "\n[\x1b[0;32m OK \x1b[0m] Finished service.\r\nssh-ed25519")
+        log = b"\xff\x96 firmware output\r\n" + serial.encode()
+        for phase, output in (("raw", log), ("escaped", repr(log).encode() + b"\n")):
+            with self.subTest(format=phase), patch.object(self.engine, "vm"), \
+                    patch.object(self.engine, "address", return_value="10.73.0.4"), \
+                    patch.object(deploy, "command", return_value=subprocess.CompletedProcess([], 0, output, b"")), \
+                    patch.object(self.engine, "ssh", return_value=subprocess.CompletedProcess(
+                        [], 0, self.boot1.encode(), b"")):
+                self.assertEqual(self.engine.bootstrap("builder", phase), self.boot1)
+            self.assertEqual(self.engine.hosts["builder"]["hostKey"], "ssh-ed25519 " + key)
+
+    def test_ambiguous_serial_host_keys_are_rejected_before_ssh(self):
+        key = base64.b64encode(b"a" * 64).decode()
+        second = base64.b64encode(b"b" * 64).decode()
+        log = self.serial(self.boot1, key).replace(
+            "CVM_SSH_BOOT_END", "ssh-ed25519 " + second + "\nCVM_SSH_BOOT_END")
+        with patch.object(self.engine, "vm"), patch.object(self.engine, "az", return_value=log), \
+                patch.object(self.engine, "ssh") as ssh, \
+                self.assertRaisesRegex(deploy.DeploymentError, "exactly one"):
+            self.engine.bootstrap("builder", "first")
+        ssh.assert_not_called()
+
     def test_authenticated_boot_diagnostics_rotation_uses_new_known_hosts_per_boot(self):
         first_key, second_key = base64.b64encode(b"a" * 64).decode(), base64.b64encode(b"b" * 64).decode()
         logs = [self.serial(self.boot1, first_key),
@@ -378,7 +470,7 @@ class SSHTests(Fixture):
         self.assertIn("BatchMode=yes", args)
         self.assertIn("IdentitiesOnly=yes", args)
         self.assertIn("HostKeyAlias=test-boot", args)
-        self.assertIn("UserKnownHostsFile=" + str(self.run / "known hosts"), args)
+        self.assertIn("UserKnownHostsFile=" + deploy.ssh_path(self.run / "known hosts"), args)
         self.assertNotIn("accept-new", str(args))
         self.assertNotIn("ssh-keyscan", str(args))
         self.assertNotIn("StrictHostKeyChecking=no", args)
@@ -736,6 +828,63 @@ class CleanupTests(Fixture):
                 self.assertRaises(deploy.DeploymentError):
             self.engine.delete_owned_resource(self.model("builder")["id"], "builder")
         self.assertEqual(azure.call_count, 1)
+
+
+class JumpHostTests(Fixture):
+    def test_requires_paired_authenticated_jump_options_and_rejects_config_injection(self):
+        args = self.arguments + ["--run-directory", str(self.workspace / "jump-plan")]
+        for extra in (
+            ["--ssh-jump-host", "relay@jump.example"],
+            ["--ssh-jump-known-hosts", str(self.workspace / "known hosts")],
+            ["--ssh-jump-host", "relay@jump.example\nProxyCommand bad",
+             "--ssh-jump-known-hosts", str(self.workspace / "known hosts")],
+        ):
+            with self.subTest(extra=extra), self.assertRaises(deploy.DeploymentError):
+                deploy.configuration(deploy.parser().parse_args(args + extra))
+        value = deploy.configuration(deploy.parser().parse_args(args + [
+            "--ssh-jump-host", "relay@jump.example",
+            "--ssh-jump-known-hosts", str(self.workspace / "nonexistent known hosts"),
+        ]))
+        self.assertEqual(value["sshJumpHost"], "relay@jump.example")
+        self.assertFalse(Path(value["sshJumpKnownHosts"]).exists())
+
+    def test_jump_configuration_is_strict_and_passes_real_openssh_parsing(self):
+        self.assertIsNotNone(shutil.which("ssh"), "OpenSSH is required for jump-host tests")
+        config = dict(self.config, sshJumpHost="relay@jump.example",
+                      sshJumpKnownHosts=str(self.workspace / "jump known hosts"))
+        path = self.run / "ssh-jump.config"
+        deploy.private_write(path, deploy.jump_configuration(config, self.engine.key))
+        result = subprocess.run(["ssh", "-G", "-F", str(path), "cvm-dracut-jump"],
+                                check=True, capture_output=True, text=True)
+        options = dict(line.split(" ", 1) for line in result.stdout.splitlines())
+        self.assertEqual(options["hostname"], "jump.example")
+        self.assertEqual(options["user"], "relay")
+        self.assertIn(options["stricthostkeychecking"], ("true", "yes"))
+        self.assertIn(options["forwardagent"], ("false", "no"))
+        self.assertEqual(options["identityfile"], Path(self.engine.key).as_posix())
+        self.assertEqual(options["userknownhostsfile"],
+                         Path(config["sshJumpKnownHosts"]).as_posix())
+
+    def test_proxyjump_preserves_guest_host_key_authentication_and_quotes_paths(self):
+        self.engine.c.update(sshJumpHost="relay@jump.example",
+                             sshJumpKnownHosts=str(self.workspace / "known hosts"))
+        self.engine.hosts["reference"] = {
+            "knownHosts": str(self.run / "per boot known hosts"), "alias": "test-boot",
+            "address": "10.73.0.4",
+        }
+        deploy.private_write(self.run / "ssh-jump.config",
+                             deploy.jump_configuration(self.engine.c, self.engine.key))
+        with patch.object(deploy, "command", return_value=subprocess.CompletedProcess(
+                [], 0, b"ok", b"")) as process:
+            self.engine.ssh("reference", "sudo true")
+        arguments = process.call_args.args[0]
+        self.assertEqual(arguments[arguments.index("-F") + 1], str(self.run / "ssh-jump.config"))
+        self.assertEqual(arguments[arguments.index("-J") + 1], "cvm-dracut-jump")
+        self.assertIn("StrictHostKeyChecking=yes", arguments)
+        self.assertIn("HostKeyAlias=test-boot", arguments)
+        self.assertIn("UserKnownHostsFile=" + deploy.ssh_path(self.run / "per boot known hosts"),
+                      arguments)
+        self.assertNotIn("accept-new", str(arguments))
 
 
 if __name__ == "__main__":

@@ -108,6 +108,20 @@ select a non-overlapping private network compatible with your approved routing.
 Existing resource groups and
 run directories are rejected; failed runs are not silently resumed.
 
+If the approved private route is through an existing SSH jump host, add:
+
+```bash
+  --ssh-jump-host '<jump-user>@<approved-jump-address>' \
+  --ssh-jump-known-hosts '/private/independently-authenticated-jump-known-hosts'
+```
+
+Both options are required together. The jump host uses the supplied private
+key, independently pinned ED25519 host keys and strict checking; guest trust
+remains independently pinned per boot. No agent forwarding is enabled.
+Set `--ssh-source-cidr` to the jump host's private source CIDR and establish
+approved routing/peering to the new subnet beforehand. The controller does not
+create peering or change an existing jump host's ingress rules.
+
 ## Run with PowerShell
 
 ```powershell
@@ -123,7 +137,8 @@ run directories are rejected; failed runs are not silently resumed.
 Remove `-Plan` to execute. The PowerShell entry point requires the same Python
 engine, not Git Bash, and has the same lifecycle and validation boundaries.
 `-NetworkAddressPrefix`, `-SubnetPrefix` and `-BuilderImage` match the corresponding
-Bash options. Plan still validates CIDR syntax, so replace the example
+Bash options. `-SshJumpHost` and `-SshJumpKnownHosts` provide the same opt-in
+authenticated jump path. Plan still validates CIDR syntax, so replace the example
 placeholders even when previewing.
 
 ## What the controllers do
@@ -183,7 +198,14 @@ Real userspace/SDK tests and actual manual Azure results are distinguished in
 
 Keep configuration, independently retained build inputs, signer/readback,
 first/reboot JSON, stderr, requested challenge and attestation evidence outside
-the checkout. An SDK token/receipt is **not** a production remote verification
+the checkout. Both entry points submit REST JSON larger than 8 KiB through a
+private request file using `--body @file`, following the legacy controller's
+file-backed approach. WSL converts request paths for the Windows Azure CLI;
+native Windows uses the CLI's bundled Python to avoid batch-file reparsing.
+Failed Azure operations retain stdout/stderr privately rather than printing
+potential credentials.
+
+An SDK token/receipt is **not** a production remote verification
 result. The wrapper says `NOT_VERIFIED`; collection and local consistency checks
 do not authenticate expected UKI identity, AK/quote/TEE binding or quote
 freshness. See [the relying-party requirements](LOCAL-BUILD.md#what-maa-does-and-what-the-verifier-must-check).

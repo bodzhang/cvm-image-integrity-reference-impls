@@ -7,7 +7,7 @@
 The Bash and PowerShell entry points share a Python deployment/cleanup engine.
 Local tests exercise configuration/plan guards, failure handling, resource
 ownership, publication and SSH evidence checks without Azure resources.
-The shared engine's 40 tests passed under both Linux and native Windows Python,
+The shared engine's 49 tests passed under both Linux and native Windows Python,
 including real RSA certificate-profile checks with OpenSSL; no tests were
 skipped. Bash argument/failure propagation and actual Windows PowerShell
 plan/network-option/failure handling checks passed. The existing 29
@@ -15,6 +15,17 @@ recipe, attestation and guest-validation regressions also passed.
 They do not establish that the new automatic controller has completed a real
 deployment. The Gallery 1.0.4 results below were obtained through the manual
 workflow; do not relabel them as controller acceptance.
+
+Live controller testing on 2026-11-13 successfully created the private builder
+and approved temporary test routing, submitted the large recipe request through
+a private JSON file, and completed builder prerequisite installation. It exposed
+Azure CLI quota strings, Windows/WSL argument-size limits, byte-literal serial
+output and interleaved service messages in SSH boot-key publication. The fixes
+have focused local regressions, including rejection of ambiguous host keys;
+SSH authentication remains strict. A fresh corrected attempt was then rejected
+by the VM SKU availability preflight before resource allocation. Complete
+automatic image build, publication, CVM first/reboot acceptance and cleanup
+remain unqualified.
 
 ## Evidence levels
 

@@ -9,6 +9,8 @@ param(
     [string] $RunDirectory,
     [string] $MaaEndpoint,
     [string] $SshSourceCidr,
+    [string] $SshJumpHost,
+    [string] $SshJumpKnownHosts,
     [string] $NetworkAddressPrefix,
     [string] $SubnetPrefix,
     [string] $BuilderImage,
@@ -34,6 +36,8 @@ if ($SshPrivateKey) { $arguments += @('--ssh-private-key', $SshPrivateKey) }
 if ($RunDirectory) { $arguments += @('--run-directory', $RunDirectory) }
 if ($MaaEndpoint) { $arguments += @('--maa-endpoint', $MaaEndpoint) }
 if ($SshSourceCidr) { $arguments += @('--ssh-source-cidr', $SshSourceCidr) }
+if ($SshJumpHost) { $arguments += @('--ssh-jump-host', $SshJumpHost) }
+if ($SshJumpKnownHosts) { $arguments += @('--ssh-jump-known-hosts', $SshJumpKnownHosts) }
 if ($NetworkAddressPrefix) { $arguments += @('--network-address-prefix', $NetworkAddressPrefix) }
 if ($SubnetPrefix) { $arguments += @('--subnet-prefix', $SubnetPrefix) }
 if ($BuilderImage) { $arguments += @('--builder-image', $BuilderImage) }
