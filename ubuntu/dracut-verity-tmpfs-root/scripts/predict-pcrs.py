@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline SHA256 PCR4/7/11 predictions for the direct-UKI systemd 255 profile."""
+"""Offline SHA256 PCR4/7/11/12/13 predictions for direct-UKI systemd 255."""
 
 import argparse
 import base64
@@ -209,7 +209,7 @@ def predict(uki, certificate, baseline, phase_path):
                     for kind, _, value in signature_entries(values["db"])),
             "Custom signer is already in the baseline db")
     phases = phase_names(phase_path)
-    events = {str(index): [] for index in (4, 7, 11)}
+    events = {str(index): [] for index in (4, 7, 11, 12, 13)}
     pcrs = {index: bytes(32) for index in events}
 
     def extend(index, label, digest):
@@ -240,9 +240,12 @@ def predict(uki, certificate, baseline, phase_path):
     return {
         "schemaVersion": 1, "bank": "sha256", "bootProfile": BOOT_PROFILE,
         "stubModel": "systemd-255", "phasePath": phase_path,
+        "externalInputPolicy": "no-external-inputs",
         "pcrs": {index: value.hex() for index, value in pcrs.items()},
         "pcr11Checkpoints": checkpoints, "events": events,
-        "scope": "Predictions only; not attestation verification or firmware baseline approval",
+        "scope": "Predictions only; not attestation verification or firmware baseline approval. "
+                 "PCR12/13 assume no external inputs and no extensions by any producer; "
+                 "these expectations neither disable inputs nor establish authenticated PCR coverage.",
     }
 
 

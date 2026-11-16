@@ -13,7 +13,7 @@ volatile; the verified ext4 lower never has a writable fallback.
 boot and first-boot/real-reboot acceptance passed on an Azure Intel TDX CVM
 using `VMGuestStateOnly`. The patched native SDK collector, tested directly in
 tmpfs without log bind mounts, also obtained a signature-verified custom-policy
-MAA token for PCRs 0-8 and 11. PCR12 remains a token-coverage gap. Stateless boot
+MAA token for PCRs 0-8 and 11. PCR12/13 remain token-coverage gaps. Stateless boot
 and expected-image remote verification remain unqualified. Gallery 1.0.4,
 rebuilt with the native collector, passed publication, first/reboot SSH
 acceptance and installed-collector custom-policy MAA testing on 2026-11-13.
@@ -294,6 +294,10 @@ The deliberately narrow `azure-direct-uki-v1` profile predicts SHA256:
   uses `VirtualSize`, not raw padding. `.pcrsig` is excluded; `.pcrpkey`, when
   present, is included. The tool returns UKI-only and successive phase
   checkpoints rather than silently treating UKI-only PCR11 as boot-complete.
+- **PCR12/PCR13:** initial all-zero SHA256 values under the
+  `no-external-inputs` policy, with no external addons, credentials,
+  system-extension images or other producers extending these PCRs. These are
+  expected policy values, not proof that the stub disables companion inputs.
 
 Only signed x64 PE32+ EFI UKIs with the supported stub marker, contiguous raw
 sections and one end-of-file PKCS7 signature are accepted. Unsupported or
@@ -376,8 +380,10 @@ instead and qualify that build. `--phase-path ''` requests the UKI-only
 checkpoint, not a claim about a fully booted guest. No phase services are
 masked or otherwise changed by this tool.
 
-JSON `pcrs` has exactly the string keys `"4"`, `"7"` and `"11"` with lowercase
-64-digit digests. `pcr11Checkpoints` records each cumulative `phasePath`;
+JSON `pcrs` has exactly the string keys `"4"`, `"7"`, `"11"`, `"12"` and `"13"`
+with lowercase 64-digit digests. `externalInputPolicy` is `no-external-inputs`;
+PCR12/13 are each 64 zeroes and their event lists are empty.
+`pcr11Checkpoints` records each cumulative `phasePath`;
 `events` records ordered digest/extension steps, and `inputs` binds the UKI,
 signer and baseline file hashes. Protect and approve this output as expected
 policy independently of the evaluated guest.
@@ -385,9 +391,11 @@ policy independently of the evaluated guest.
 Matching these predictions to authenticated MAA claims adds expected-image
 comparison for this model; this helper does not implement that verifier,
 independent AK/quote/TEE validation, fresh challenge binding or rollback
-protection. PCR12 is not predicted or made unnecessary: companion addons and
-other PCR12 inputs remain a separate policy concern, and the tested MAA token
-still omits PCR12. No addon-disable enforcement is introduced here.
+protection. The PCR12/13 zero references require qualification of the deployed
+empty-input sequence; nonempty external-input sequences are not modeled.
+Tested MAA tokens still omit PCR12/13, even when both were requested. Emitting
+expected values neither supplies authenticated coverage nor disables addons,
+credentials or system extensions.
 
 ## 3. Publish and enroll the actual signer
 
@@ -560,7 +568,7 @@ SSH connection; do not treat partial output as acceptance. File hashes establish
 transfer consistency, not remote attestation authenticity.
 
 The wrapper always invokes the pinned SDK's **guest** attestation flow with
-`--provider maa --pcr-index 0,1,2,3,4,5,6,7,8,11,12 --user-data hex:<nonce> --json --show-request`.
+`--provider maa --pcr-index 0,1,2,3,4,5,6,7,8,11,12,13 --user-data hex:<nonce> --json --show-request`.
 PCR 4 covers firmware image measurements, PCR 7 covers Secure Boot policy,
 and **PCR 11 covers systemd-stub's UKI section measurements**, including the
 embedded `.cmdline` with `roothash=` and the data/hash partition identifiers.
@@ -613,9 +621,9 @@ Evidence is private and volatile under the new `/run` directory:
   provenance; it explicitly says `NOT_VERIFIED`;
 - `tokenClaimsUnverified` in the receipt reports token coverage and raw PCR
   values, without authenticating the JWT. Coverage and values must match the
-  request for PCRs 0-8 and 11. Missing PCR12 emits
-  `ATTESTATION_TOKEN_PCR_COVERAGE_GAP=[12]` and leaves coverage incomplete;
-  it is not silently removed from the request.
+  request for PCRs 0-8 and 11. Missing PCR12/13 emits
+  `ATTESTATION_TOKEN_PCR_COVERAGE_GAP=[12, 13]` when both are absent and leaves
+  coverage incomplete; neither is silently removed from the request.
 
 Retrieve the evidence outside the guest before reboot. Protect tokens and raw
 VM-identifying evidence; do not commit them. Failed collection retains
@@ -652,11 +660,11 @@ that MAA can attest PCR-11 coverage; the index list is not a digest.
 That example is for Windows. Our actual Linux/TDX token additionally contains
 `x-ms-azurevm-attested-pcr-values`, mapping names such as `pcr7` and `pcr11` to
 base64 SHA-256 values. Its signature was verified and its reported values
-matched the submitted evidence. The diagnostic requested `0-8,11,12`, but
-the token covers only `0-8,11`: **PCR 12 is a known MAA token-coverage gap**,
-not a reason to remove it from the required expanded request. Its coverage and
-raw value are absent from the tested token, so PCR 12 must not be claimed as
-attested. See [the explicit gap and limits](VALIDATION.md#known-gap-maa-does-not-return-pcr-12-in-the-tested-token).
+matched the submitted evidence. The latest diagnostic requested and quoted
+`0-8,11,12,13`, but the token covers only `0-8,11`: **PCR12 and PCR13 are known
+MAA token-coverage gaps**, not a reason to remove them from the request.
+Their coverage and raw values are absent from the tested token, so neither
+can be claimed as attested. See [the explicit gaps and limits](VALIDATION.md#pcr13-inclusive-tmpfs-diagnostic-2026-11-16).
 Do not assume arbitrary custom claim emission or a particular provider policy.
 
 An independent relying party must:
@@ -798,10 +806,11 @@ This relaxation allows a token despite failed default db validation; it does
 needs independently authenticated expected signer/UKI measurements and the
 quote/TEE/freshness checks above. Keep genuine systemd userspace events in the
 attestation evidence; changing policy does not repair a PCR/event-log mismatch.
-The tested expanded diagnostic requests PCRs `0,1,2,3,4,5,6,7,8,11,12`.
+The latest expanded diagnostic requests PCRs `0,1,2,3,4,5,6,7,8,11,12,13`.
 Neither this policy nor a tmpfs SDK diagnostic changes Gallery 1.0.3's installed
-firmware-only collector. Current recipe builds install the patched SDK and
-expanded-PCR wrapper before generating verity data, as tested in Gallery 1.0.4.
+firmware-only collector. Gallery 1.0.4 tested installation of the patched SDK
+and wrapper before generating verity data, with a `0-8,11,12` request. New builds
+also select PCR13; existing images are not updated by this source change.
 
 ## Threat model and limits
 

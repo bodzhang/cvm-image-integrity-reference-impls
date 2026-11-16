@@ -231,7 +231,11 @@ class PredictionTests(unittest.TestCase):
                     else:
                         predictor.main()
                         result = json.loads(output.getvalue())
-                        self.assertEqual(set(result["pcrs"]), {"4", "7", "11"})
+                        self.assertEqual(set(result["pcrs"]), {"4", "7", "11", "12", "13"})
+                        self.assertEqual(result["externalInputPolicy"], "no-external-inputs")
+                        for index in ("12", "13"):
+                            self.assertEqual(result["pcrs"][index], "0" * 64)
+                            self.assertEqual(result["events"][index], [])
                         self.assertEqual(result["inputs"]["ukiSha256"], predictor.sha256(synthetic_uki()).hex())
                         self.assertTrue(all(len(value) == 64 for value in result["pcrs"].values()))
                     verify.assert_called_once_with(synthetic_uki(), CERTIFICATE)

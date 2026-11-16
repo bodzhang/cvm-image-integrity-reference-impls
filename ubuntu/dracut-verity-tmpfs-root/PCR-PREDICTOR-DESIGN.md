@@ -1,17 +1,18 @@
-# Offline PCR4, PCR7 and PCR11 predictor design
+# Offline PCR4, PCR7, PCR11, PCR12 and PCR13 predictor design
 
 [Recipe](README.md) | [Invocation and input preparation](LOCAL-BUILD.md#optional-offline-pcr-prediction) | [Qualification evidence](VALIDATION.md#evidence-levels)
 
 ## Status and purpose
 
 [predict-pcrs.py](scripts/predict-pcrs.py) calculates expected SHA-256 PCR4,
-PCR7 and PCR11 values **without booting the candidate image or reading its
-event log**. It combines final build artifacts with an independently approved
+PCR7 and PCR11 values and emits expected PCR12/13 values for a
+**no-external-inputs policy**, without booting the candidate image or reading
+its event log. It combines final build artifacts with an independently approved
 firmware baseline and an explicit boot-phase path. It neither changes the
 image nor contacts Azure, a TPM or Microsoft Azure Attestation (MAA).
 
 The implemented profile, `azure-direct-uki-v1`, models direct firmware launch
-of one signed x64 systemd-stub 255 UKI. Artifact-based predictions matched
+of one signed x64 systemd-stub 255 UKI. Artifact-based PCR4/7/11 predictions matched
 retained MAA-signed values for the tested reference. **Obtaining an independently
 approved base Secure Boot database remains unresolved.** The qualification
 baseline came from a separate controlled reference, not a published or approved
@@ -63,16 +64,209 @@ signature headers. It checks structure, not the trustworthiness of every
 baseline certificate. It rejects duplicate/unexpected JSON fields, unsupported
 profiles and a baseline file larger than 256 KiB.
 
-The output includes final `pcrs` with string keys `"4"`, `"7"` and `"11"`,
-ordered event digests and intermediate PCR values, cumulative
+The output includes final `pcrs` with string keys `"4"`, `"7"`, `"11"`, `"12"`
+and `"13"`, ordered event digests and intermediate PCR values, cumulative
 `pcr11Checkpoints`, model identifiers and the SHA-256 hashes of all three input
 files. No prediction JSON is emitted on handled input/signature/dependency
 failure; the CLI exits with status 2. Output is not signed or approved by the
 tool: the relying party must protect, review and version it as expected policy.
 
+`externalInputPolicy` is `no-external-inputs`: PCR12 and PCR13 are each 32 zero
+bytes (64 hexadecimal zeroes), with empty event lists. These expectations assume
+no external addons, credentials or system extensions, and no other producer
+extends either PCR. They are policy references, not values derived from the UKI
+or proof that companion inputs are disabled. Nonempty external-input sequences
+are not modeled; the deployed empty-input sequence still needs qualification.
+
+## PCR selection: what the image policy needs to establish
+
+For this direct-UKI design, **PCR4 establishes the approved UKI identity** and
+**PCR7 establishes the approved Secure Boot policy**. External boot inputs must
+be constrained through PCR12 or qualified input disablement. **PCR11 value
+verification is optional when the independently approved expected PCR4 is
+enforced**; it supports additional component-level or boot-phase policies.
+These checks assume an approved platform foundation, the characterized boot
+path and coverage of all security-relevant external inputs; they do not alone
+establish a trustworthy CVM. **The predictor calculates PCR4/7/11 and emits
+zero-valued PCR12/13 expectations for the no-external-inputs policy;
+the PCR12/13 signed-coverage gaps remain open.** The current systemd-stub 255
+also supports PCR13-measured initrd system extensions; their exclusion or
+approval remains an additional condition.
+
+### Start with the hardware-bound measurement foundation
+
+The [Azure guest-attestation design][azure-attestation-design] assigns UEFI and
+the guest paravisor, including its vTPM, to hardware-report coverage. The report
+binds runtime claims containing the vTPM attestation public key; the verifier
+must validate that binding, the hardware endorsements, the approved platform
+identity/security version and the quote signed by that key. A valid signature
+alone does not approve the software identity or its configuration. Freshness
+and binding key release to the intended receiving endpoint are also required.
+
+Once the launch identity is authenticated **and approved**, the embedded UEFI
+and its built-in drivers need not be approved again merely by pinning PCR0/2.
+This does not cover separately loaded firmware/drivers or approve every runtime
+platform setting. Required settings still need authenticated evidence or an
+invariant enforced by the approved implementation. A generic Secure Boot claim
+is not a substitute for checking the complete measured Secure Boot policy.
+
+### Image approval, external inputs and optional PCR11 checks
+
+| PCR | Image-approval rationale |
+| --- | --- |
+| **4: UEFI-measured bootloader/UKI** | UEFI measures EFI bootloaders/applications into PCR4 before transferring control to them. In this direct-UKI design, UEFI measures the UKI itself, whose Authenticode digest covers the systemd-stub code, kernel, initrd and embedded command line, including the dm-verity root hash and enforcement options. Matching an independently approved expected PCR4 value confirms the approved UKI and measured boot sequence, rather than merely confirming that approved UEFI firmware ran. An additional measured bootloader or boot attempt changes PCR4, even if Secure Boot accepts the image. |
+| **7: Secure Boot policy** | Establishes the measured `SecureBoot`, PK, KEK, `db`, `dbx` and used authority against an approved baseline. An enrolled customer certificate or a successful signature check alone does not establish the rest of the trust store. Appending a customer signer retains the template's other signers; a signer can authorize many images, so PCR7 does not replace exact-image approval. References must account for provisioning generation and persisted variable state. |
+| **11: optional component and boot-phase checks** | Checking the expected PCR11 value is optional when the independently approved expected PCR4 is enforced: PCR4 already covers the kernel, initrd and embedded command line. PCR11 provides separate payload-section measurements and later boot-phase extensions. A validated event log exposes individual component digests, including the `.cmdline` digest that binds the embedded verity root hash and enforcement options. A selected boot-phase checkpoint can be used with systemd service dependencies to require successful attestation before releasing secrets to be sealed to the PCR11 value for that phase. PCR11 does not cover the stub code itself. |
+| **12: external boot inputs** | With Secure Boot enabled and an embedded `.cmdline`, systemd-stub 255 ignores ordinary EFI invocation arguments, but still accepts valid signed `.addon.efi` files from the ESP, appends their parameters to the embedded command line and measures those additions into PCR12. A host able to modify the ESP can select or reorder already-signed addons accepted by Secure Boot without modifying the UKI itself. Signature validity does not approve their use or effective parameters for this image; whether appended options override embedded ones depends on the option's parser. PCR12 also covers accepted DeviceTree addons and companion credential archives. Verify an independently approved external-input sequence, or establish that the approved implementation disables or independently constrains those inputs. |
+| **13: external system-extension images** | The retained qualified UKI uses stock Ubuntu **systemd-stub `255.4-1ubuntu8.18`**, which collects companion `.raw` system-extension images, packages them into an additional initrd and measures the archive into PCR13. This pickup path is not disabled for confidential VMs. Extensions can supply software outside the verity lower if consumed; collection alone does not prove activation. Approve the extension inputs using PCR13 or establish that this path is disabled or cannot affect the approved boot/root behavior. Neither input approval nor non-consumption is established here. New builds install a wrapper that requests PCR13; a [tmpfs diagnostic requesting it](VALIDATION.md#pcr13-inclusive-tmpfs-diagnostic-2026-11-16) received no signed PCR13 coverage or value from MAA. |
+
+The root hash in the approved `.cmdline` commits to the dm-verity lower's
+contents. The approved kernel/initrd must actually establish the intended
+read-only mapping and reject corruption; an attacker substituting different
+partition contents cannot satisfy the approved root hash without breaking the
+hash assumption. Verification occurs on reads, not as a full-disk scan at
+attestation time. This chain identifies the protected lower, **not everything
+that can execute through the writable tmpfs upper**; the recipe's separate
+[runtime-hardening limitations](README.md#testing-components-and-production-hardening)
+still apply.
+
+With Secure Boot enabled and an embedded `.cmdline`, systemd-stub 255 ignores
+ordinary EFI command-line overrides, but still supports companion addons and
+credentials. Secure Boot approval of an addon is not approval of its use, order
+or effective parameters for this image. A no-external-input policy should
+require an authenticated PCR12 value matching the qualified empty-input
+sequence: normally the initial all-zero SHA-256 value if no producer extends
+PCR12. That expected sequence still needs qualification for the deployed image.
+Alternatively, approve an exact external-input sequence. Omitting PCR12 is
+justified only if the approved implementation demonstrably disables or
+independently constrains every relevant input path. Empty ESP directories or
+an unmounted ESP after boot do not establish that property.
+
+### Why other PCRs are not fixed image-reference inputs
+
+The [Linux TPM PCR Registry][linux-pcr-registry] describes common roles, not a
+universal event sequence. The following rationale concerns this approved
+boot/root-integrity design, not arbitrary software behavior or verifier rules
+implemented by this predictor. Once an exclusion is justified, the relying
+party does not need to parse that PCR's event log merely to look for surprises.
+Qualifying the platform/profile is separate from checking every PCR on every
+attestation.
+
+| PCR | Treatment and conditions |
+| --- | --- |
+| **0 / 2** | No duplicate pin is needed for firmware and built-in drivers already covered by the approved launch identity. The recipe installs no additional firmware-volume or EFI-driver stage, but that is not proof that Azure UEFI blocks such stages. The public source does not establish a blanket prohibition; see the qualification gap below. Separately loaded code outside launch coverage must be excluded by an approved invariant or independently approved, using PCR0/2 where applicable. PCR7 signer approval alone is not exact-driver approval. |
+| **1** | No separate PCR1 check is needed for boot-entry selection: PCR4 establishes the executed application sequence and binds the UKI payload, including embedded root settings. Choosing different boot code changes PCR4; PCR7 need not change when both images use the same signer. Configuration affecting the accepted UKI must be constrained by the approved implementation or the external-input policy, not inferred from boot variables. This does not claim PCR4 covers external EFI drivers or every runtime input. |
+| **3** | No separate PCR3 value or event-log check is needed for this image policy. The inspected [Microsoft UEFI ReadyToBoot path][mu-boot-measurements] contributes a separator, not additional software identity or a security-configuration inventory. With that implementation approved and required settings covered elsewhere, parsing this log adds no independent assurance about the approved boot/root behavior. |
+| **5** | No separate GPT/PCR5 check is needed for this recipe's boot/root-integrity claim. Its approved command line disables GPT discovery, fixes the data/hash PARTUUIDs and requires the approved verity root hash; persistent fstab mounts/swap are removed. GPT edits cannot enable disabled discovery or substitute different accepted lower contents. An image that already enables discovery has a different trust argument: GPT edits can introduce extra unverified mounts without changing PCR4/7/11. See the distinction below. |
+| **6** | No PCR6 evaluation is required for code identity or protected-root integrity. [Microsoft VM UEFI][mu-vm-measurements] measures a VM UUID and its build architecture (`X64` or `AARCH64`), not an additional authenticated CPU/TEE identity. A host-supplied UUID does not approve software behavior; hardware/platform identity comes from the hardware-attestation foundation, not this event. |
+| **8 / 14** | No separate PCR8/14 check is needed to exclude GRUB/shim in this profile. Approved UEFI identity alone does not exclude them; the required direct-UKI PCR4 sequence does. Inserting a measured intermediate bootloader changes that sequence even if Secure Boot accepts its signer. Intentionally supporting shim/GRUB requires a different qualified boot profile and its applicable policy inputs. |
+| **9** | No separate PCR9 check is needed when PCR4 approves the embedded initrd and UKI-derived fragments, PCR12 approves external credentials/parameters, and the PCR13 extension condition is resolved. An approved UKI does not imply a single immutable initrd: systemd-stub 255 combines it with additional fragments. Under those input-coverage conditions, a kernel initrd measurement supplies no independent image-approval input; see the fragment sources below. |
+| **10** | No PCR10 check is needed to establish this recipe's dm-verity lower identity. IMA policy belongs to the guest kernel/userspace, not an Azure-host or UEFI policy setting: kernel defaults/boot parameters and guest policy loading determine it. Approved boot inputs constrain initial configuration; privileged guest code may load policy where the kernel permits it. Adding an IMA-based runtime claim would require its own approved policy and measurement evidence; this design makes no such claim. |
+| **15** | No PCR15 evaluation is required for the approved boot code or read-only lower contents. Filesystem metadata within that lower is already bound by the approved verity root hash. Generated machine IDs and volume-key measurements are not additional software identities, and this recipe does not rely on them for its boot/root-integrity decision. Instance-affinity or local-sealing policies are separate objectives, not implied image-approval requirements. |
+| **16-23** | Debug, dynamic-launch and application-support uses do not establish this static UEFI/UKI boot chain. The profile does not perform a DRTM launch, and resettable debug/application registers are not substitutes for boot evidence. A different launch design needs its own policy. |
+
+**External firmware/driver qualification.** The inspected Microsoft UEFI
+[media policies][mu-image-policies] deny execution on a Secure Boot security
+violation, rather than unconditionally rejecting external images. Its
+[verification library][mu-image-verification] distinguishes this from
+`NEVER_EXECUTE`, and the pinned [BDS path][mu-driver-options] processes EFI
+driver load options. This does not prove an Azure host can populate those
+options in a deployed CVM, or that an external driver was observed. It does mean
+that neither this recipe's lack of a driver-install step nor the inspected
+UEFI identity alone establishes a no-external-driver invariant. Before omitting
+PCR0/2 for code outside hardware-launch coverage, qualify the deployed
+platform's restrictions or add independent approval evidence.
+
+**GPT cannot turn discovery on, but enabled discovery can consume GPT.**
+The generated [command line](scripts/image_policy.py) sets
+`rd.systemd.gpt_auto=0 systemd.gpt_auto=0 rd.fstab=0`. Changing partition types,
+names or identifiers does not change those authenticated settings. With no
+additional unverified mounts in this boot policy, redirecting a fixed PARTUUID
+still has to supply data satisfying the approved verity hash or fail. This
+does not prevent host-induced boot failure, which is outside the integrity
+claim. By contrast, if an approved image leaves automatic discovery enabled,
+the host can change GPT to present an additional eligible `/home` or `/srv`
+partition without changing the UKI or PCR4/7/11. Discovery being *supported* by
+the code is therefore different from discovery being *enabled* by the accepted
+configuration. Supporting that alternative requires approval/authentication of
+the extra mounts and their contents; PCR5 alone does not authenticate file data.
+The same applies to extra mounts introduced through other configuration paths.
+
+**Initrd fragments are not all embedded in the UKI.** In version 255,
+[systemd-stub collects `.raw` extensions][stub-255-sysext] and
+[combines the embedded initrd with credential, global-credential, system-extension,
+PCR-signature and public-key fragments][stub-255-initrds]. UKI-derived fragments
+are bound by the approved UKI; accepted external credential inputs belong to
+PCR12, and extension images belong to PCR13. This is why PCR9 is redundant only
+after those inputs are constrained. Packaging an extension does not by itself
+prove that this initrd/userspace consumes it, but the absence of build-generated
+extensions does not prove that host-supplied companions cannot be consumed.
+That disablement/non-consumption condition needs qualification.
+
+These exclusions concern the stated boot/root-integrity claim. They do not
+silently add instance-identity or IMA requirements, and they are not a universal
+fixed-register sufficiency claim for arbitrary Azure images or workloads.
+
+### Evidence coverage and related design
+
+For a fixed qualified sequence, comparing authenticated PCRs with independently
+approved predictions can enforce that sequence. A log-aware verifier must also
+validate event-specific digests and complete replay for the PCRs its policy
+relies on, including relevant firmware and userspace logs, against the fresh
+quote. This does not require semantic evaluation of otherwise irrelevant PCRs
+merely because they were collected. Raw quote verification must still validate
+the complete selected-PCR digest and signature correctly. Replay establishes
+consistency, not approval; references must not be derived from the evaluated
+target itself.
+Changed firmware, guest measurement services or quote timing can invalidate the
+sequence, including the expected empty PCR12 value.
+
+The wrapper installed by new builds requests exactly `0-8,11,12,13`, while the
+tested MAA tokens authenticate only `0-8,11`. Requesting or locally reading
+PCR12/13 is not remote verification of them; an omitted claim is neither zero
+nor a match. A production policy relying on these PCRs must obtain authenticated
+coverage or establish the qualified input-disablement alternative above. A tmpfs
+diagnostic requested and quoted both PCR12 and PCR13, but its MAA token omitted
+both from signed coverage and values. PCR13 remains an open condition if system
+extensions remain possible. Updating the wrapper does not modify retained images
+or provide a completed relying-party verifier.
+
+The [AzureStack-Tools CVM Image Builder design][azurestack-integrity] provides
+the same useful UKI -> embedded root hash -> dm-verity content chain and
+describes build-time PCR4/11 calculations. Its [PCR section][azurestack-pcrs]
+masks phase services to stabilize PCR11; this recipe instead retains explicit,
+qualified phase paths. That README does not supply a complete PCR7/12 policy
+or justify omitting external-input checks. Its SquashFS/selective-tmpfs layout
+also differs from this recipe's ext4 lower/whole-root writable overlay, so its
+runtime-integrity claims cannot be imported unchanged.
+
+[azure-attestation-design]: https://learn.microsoft.com/en-us/azure/confidential-computing/guest-attestation-confidential-virtual-machines-design
+[linux-pcr-registry]: https://uapi-group.org/specifications/specs/linux_tpm_pcr_registry/
+[mu-boot-measurements]: https://github.com/microsoft/mu_basecore/blob/7cff1f44f9da08a001cbd657fa178a72bf130b64/SecurityPkg/Tcg/Tcg2Dxe/Tcg2Dxe.c#L2974-L3007
+[mu-vm-measurements]: https://github.com/microsoft/mu_msvm/blob/9aebaaf125ee9a857e7394c7a3142c0ef0f981ce/MsvmPkg/VmMeasurementDxe/VmMeasurementDxe.c#L34-L70
+[mu-image-policies]: https://github.com/microsoft/mu_msvm/blob/9aebaaf125ee9a857e7394c7a3142c0ef0f981ce/MsvmPkg/MsvmPkgX64.dsc#L543-L546
+[mu-image-verification]: https://github.com/microsoft/mu_msvm/blob/9aebaaf125ee9a857e7394c7a3142c0ef0f981ce/MsvmPkg/Library/DxeImageVerificationLib/DxeImageVerificationLib.c#L1770-L1802
+[mu-driver-options]: https://github.com/microsoft/mu_basecore/blob/7cff1f44f9da08a001cbd657fa178a72bf130b64/MdeModulePkg/Universal/BdsDxe/BdsEntry.c#L935-L942
+[stub-255-sysext]: https://github.com/systemd/systemd/blob/v255/src/boot/efi/stub.c#L688-L699
+[stub-255-initrds]: https://github.com/systemd/systemd/blob/v255/src/boot/efi/stub.c#L776-L795
+[azurestack-integrity]: https://github.com/Azure/AzureStack-Tools/blob/0e4a9f32c4677e2ee3b687032e0472b890a772b6/ConfidentialComputing/CvmImageBuilder/README.md#how-integrity-protection-works
+[azurestack-pcrs]: https://github.com/Azure/AzureStack-Tools/blob/0e4a9f32c4677e2ee3b687032e0472b890a772b6/ConfidentialComputing/CvmImageBuilder/README.md#tpm-pcr-measurements
+
+Guest-input behavior above follows [systemd-stub 255][stub-255]; GPT discovery
+conditions follow [systemd-gpt-auto-generator 255][gpt-auto-255], and guest IMA
+policy loading is described by the [kernel IMA policy interface][ima-policy].
+Public UEFI source illustrates a particular implementation, not a guarantee of
+the firmware deployed on every Azure CVM. Qualify its applicability before
+relying on an exclusion.
+
+[stub-255]: https://www.freedesktop.org/software/systemd/man/255/systemd-stub.html
+[gpt-auto-255]: https://www.freedesktop.org/software/systemd/man/255/systemd-gpt-auto-generator.html
+[ima-policy]: https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/ima_policy
+
 ## Measurement model
 
-All three PCRs start at 32 zero bytes for the modeled boot. Each event extends:
+All five PCRs start at 32 zero bytes for the modeled boot. PCR12/13 remain
+unchanged under the no-external-inputs policy. Each modeled event extends:
 
 ```text
 PCR_next = SHA256(PCR_current || event_digest)
@@ -81,9 +275,16 @@ PCR_next = SHA256(PCR_current || event_digest)
 Event order and exact serialized bytes matter; matching a set of certificate
 fingerprints or section hashes is insufficient.
 
-### PCR4: launched EFI application
+### PCR4: UEFI measurement of the bootloader/UKI
 
-The profile extends exactly three digests:
+UEFI measures the EFI bootloader/application into PCR4 before executing it.
+Here, the UKI is launched directly: systemd-stub is its EFI entry point, rather
+than a separate shim or GRUB stage. The firmware's measurement covers the UKI's
+stub code and embedded kernel, initrd and `.cmdline`, including the verity root
+hash and enforcement options. These embedded inputs are therefore already
+bound by an independently approved expected PCR4 value.
+
+The profile models exactly three digests extended by UEFI:
 
 1. SHA256 of ASCII `Calling EFI Application from Boot Option`, without a NUL.
 2. SHA256 of four zero bytes (`EV_SEPARATOR`).
@@ -137,7 +338,22 @@ certificate DER encoding, signature-list boundaries/order, owner GUID and the
 authority/event sequence must also match. Firmware selecting another permitted
 authority or adding another authority event changes PCR7.
 
-### PCR11: UKI content and explicitly selected phases
+### PCR11: optional component and boot-phase verification
+
+**PCR11 value verification is optional when an independently approved expected
+PCR4 value already establishes the exact UKI and measured boot sequence.** Every
+static UKI section measured into PCR11 is also covered by PCR4. PCR11 adds
+section-level visibility and later boot-phase measurements, not additional
+static-content coverage.
+
+A component-level policy can validate the PCR11 event sequence and replay
+against authenticated PCR11, then compare individual section digests with
+independently approved references. The `.cmdline` content digest commits to the
+complete embedded command line, including the verity root hash and enforcement
+options; it does not reveal the command-line text or root hash. Such a policy
+still needs separate approval of the stub implementation, which PCR11 does not
+measure. PCR11 component checks alone are not a replacement for full UKI
+approval through PCR4.
 
 For each present, nonempty section in the following **model order**, the
 predictor extends SHA256 of the ASCII section name including its terminating
@@ -156,7 +372,11 @@ the UKI must still come from the approved build.
 For each requested phase, extend SHA256 of its ASCII name without a NUL.
 The output records the UKI-only checkpoint and every successive phase prefix.
 The predictor does not inspect service enablement, discover phases, mask
-services or prove a phase has occurred on the evaluated guest.
+services or prove a phase has occurred on the evaluated guest. If a relying
+party chooses to enforce a boot-phase checkpoint, it must compare authenticated
+PCR11 evidence with the independently approved reference for that checkpoint.
+Phase matching is not general runtime-integrity proof. The predictor continues
+to emit PCR11 values even when the relying party does not require that check.
 
 ## Base database acquisition: the main open trust input
 
@@ -232,10 +452,11 @@ production policy without the independent approval process above.
 | Baseline origin and enrollment determinism | Establish one of the acquisition routes above, including the complete variable bytes, owner GUID and authority-selection behavior. A provenance string and hash pin only record an approval decision; they cannot create trust. |
 | Baseline lifecycle | Define authenticated distribution, applicability, revocation and rollback policy for firmware/template/PK/KEK/db/dbx changes. When Azure changes the applicable variable bytes, obtain, independently approve and pin a replacement baseline, then regenerate expected PCRs. Persisted guest firmware state can differ from newly provisioned defaults; qualify both initial and subsequent boots. Never auto-approve mismatch-derived baselines. |
 | Profile and phase qualification | Requalify changed firmware, enrollment serialization, authority selection, measurement sequences, boot paths, stub implementations or phase services. Updating baseline bytes alone cannot accommodate changed measurement behavior; update and qualify the predictor model/profile where necessary. The current tool neither detects Azure implementation changes nor proves all systemd 255 variants behave identically. |
+| External firmware/driver coverage | Establish that separately loaded firmware volumes/EFI drivers outside approved hardware-launch coverage cannot affect the boot, or independently approve them using applicable measurements. The recipe installs none, but the inspected UEFI source does not prove deployed Azure configurations prohibit them. |
 | Firmware acceptance | `sbverify` is not a full firmware trust/revocation emulator. Validate actual enrollment and boot behavior; a successful prediction does not guarantee firmware will accept the UKI. |
 | Build integration and policy release | Decide where to invoke the predictor after final signing, retain its inputs/output, and approve/version expected values with each image release. Current invocation is manual and opt-in. |
 | Relying-party verification | Implement authenticated quote/MAA claim validation, fresh challenge binding, required PCR coverage and comparison to independently approved predictions, with explicit mismatch rejection and rollback protection. Prediction JSON alone performs none of these. |
-| PCR12 and external inputs | Addons and external credentials remain separate policy inputs. This tool neither predicts PCR12 nor disables those capabilities; tested MAA tokens omit PCR12. Matching PCR4/7/11 does not resolve that gap. |
+| PCR12/PCR13 and external inputs | Addons, external credentials and initrd system extensions remain separate policy inputs. The predictor emits zero-valued PCR12/13 references for a no-external-inputs policy; it does not model nonempty input sequences or disable those capabilities. New builds request both PCRs, but tested MAA tokens omit PCR12/13, including the tmpfs diagnostic that requested both. Obtain authenticated coverage and qualify the empty-input sequence, or establish qualified disablement. Matching PCR4/7/11 does not resolve those gaps. |
 | Runtime integrity | PCR matching does not establish that the writable tmpfs overlay or retained cloud-init/agent/SSH management paths are hardened. Apply the recipe's separate production-hardening policy. |
 
 The [focused tests](tests/test_pcr_prediction.py) cover serialized-variable

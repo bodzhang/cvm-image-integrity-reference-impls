@@ -31,7 +31,7 @@ overlay.
 acceptance and installed native-collector MAA testing passed. The shared controller
 built/uploaded a fresh image and completed Gallery replication; recovered managed
 first/reboot acceptance and cleanup also passed. An uninterrupted one-command
-deployment has not yet been demonstrated. PCR12 token coverage, stateless boot and production-complete
+deployment has not yet been demonstrated. PCR12/13 token coverage, stateless boot and production-complete
 expected-image remote verification remain unqualified.
 
 ## Supported baseline
@@ -42,7 +42,7 @@ expected-image remote verification remain unqualified.
 | Demonstrated source kernel | `7.0.0-1016-azure-fde`, with matching source modules |
 | Boot integration | Ubuntu 24.04, Dracut 060 / systemd 255 families |
 | Attestation SDK | Commit `8774be30f452060c56372d34ccbe34c3d3f3c577` plus the SHA-256-pinned [native systemd log patch](patches/sdk-systemd-event-log.patch) |
-| Attestation PCR selection | Exactly `0-8,11,12`; tested MAA token covers `0-8,11` |
+| Attestation PCR selection | New builds request exactly `0-8,11,12,13`; tested MAA token covers only `0-8,11` |
 | Reference CVM | `Standard_DC4es_v6`, Intel TDX, Secure Boot/vTPM, `VMGuestStateOnly` |
 | Builder | Dedicated Ubuntu 24.04 x86-64 Linux, separate from the reference CVM |
 | Controllers | Bash on Linux or PowerShell 7 on Windows, both using Python 3 |
@@ -264,7 +264,7 @@ signer, kernel, live verity/hash/devices, read-only lower mount, tmpfs,
 agents/cloud-init and installed collector provenance.
 Then authenticate the regenerated host key after reboot and collect from the
 installed SDK with a fresh controller challenge and approved MAA endpoint;
-retain explicit PCR12 coverage-gap reporting. No SDK override is used.
+retain explicit PCR12/13 coverage-gap reporting. No SDK override is used.
 
 Guest acceptance confirms the mounted dm-verity lower and its expected hash/devices
 on both boots; it does not scan all disk blocks. The default clean-room build
@@ -354,8 +354,10 @@ needs a new signer/enrollment unless you retained an approved signing service.
 After building, [predict-pcrs.py](scripts/predict-pcrs.py) can calculate SHA256
 PCR4, PCR7 and PCR11 from the final signed UKI, its exact signer DER, an
 independently approved/pinned firmware baseline and an explicit PCR11 phase
-path. It checks the UKI signature and emits JSON with expected PCRs, ordered
-event digests and PCR11 checkpoints. See the
+path. It also emits all-zero PCR12/13 expectations for a no-external-inputs
+policy; these do not prove companion inputs are disabled or supply authenticated
+PCR coverage. It checks the UKI signature and emits JSON with expected PCRs,
+ordered event digests and PCR11 checkpoints. See the
 [baseline preparation and invocation](LOCAL-BUILD.md#optional-offline-pcr-prediction).
 
 This is opt-in post-build tooling; default builds and attestation validation
@@ -377,8 +379,8 @@ remote-attestation verifier.
   or blindly accept an `ssh-keyscan` result.
 - `NonPersistedTPM` remains blocked in the tested custom-key configuration.
   Do not disable Secure Boot to make a failed image boot.
-- The tested custom-policy MAA token covers PCRs 0-8 and 11, **not PCR12**.
-  Keep PCR12 in the request and do not claim complete coverage.
+- The tested custom-policy MAA token covers PCRs 0-8 and 11, **not PCR12/13**.
+  Keep PCR12/13 in the request and do not claim complete coverage.
 - No production-complete root-hash attestation, rollback protection,
   confidential OS-disk encryption or general CVM-family support is claimed.
 

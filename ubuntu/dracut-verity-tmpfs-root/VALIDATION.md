@@ -295,11 +295,35 @@ but is **absent from the signed coverage/value claims**. Do not claim complete
 coverage of the requested set or infer that a zero PCR alone explains omission:
 the token includes PCR 8 with a zero value.
 
-Keep PCR 12 in the required expanded request `0-8,11,12`; do not remove it to
+Keep PCR 12 in the request (new builds request `0-8,11,12,13`); do not remove it to
 hide the gap. Until the provider returns both its signed coverage and value,
 a relying party cannot verify PCR 12 from this token alone. The cause remains
 unestablished; this observed gap is not a claim that every MAA configuration
 omits PCR 12.
+
+### PCR13-inclusive tmpfs diagnostic, 2026-11-16
+
+The existing managed-reference CVM's installed native SDK was invoked directly
+with `--pcr-index 0,1,2,3,4,5,6,7,8,11,12,13` and a fresh relying-party
+user-data challenge. Evidence was staged in a private tmpfs directory under
+`/run` and retrieved over authenticated SSH with matching SHA-256 hashes.
+The installed collector and wrapper hashes matched the independent build
+record before and after collection. No image rebuild, collector replacement,
+VM restart, network change or MAA policy change was made.
+
+The actual SHA-256 TPM quote selects exactly `0-8,11,12,13`; its aggregate digest
+matches the submitted values. PCR13 was all zero. The existing custom-policy
+provider issued a token whose RS256 signature, issuer, lifetime and reported PCR
+values were independently verified. Both signed coverage and signed values
+still contain only **`0-8,11`**: **PCR12 and PCR13 are absent**. Token issuance
+therefore does not provide relying-party PCR13 verification for this test.
+This does not establish behavior for nonzero PCR13 or every MAA configuration.
+At test time, the installed wrapper still requested `0-8,11,12`. The recipe now
+selects `0-8,11,12,13` in its image-installed wrapper, SDK build metadata and
+controller receipt checks, explicitly recording either or both missing PCR12/13
+claims. This source update has not been rebuilt into or deployed as a new image.
+The diagnostic does not add independent AK/quote-signature/TEE authentication or
+fresh quote-challenge binding.
 
 ### Verified evidence and remaining limits
 
