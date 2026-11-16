@@ -135,6 +135,9 @@ published/approved factory baseline. No image rebuild, firmware/policy/network
 change, full disk scan or reboot was performed for predictor qualification.
 The existing PCR12 gap and addon capability are unchanged. See
 [profile assumptions and baseline preparation](LOCAL-BUILD.md#optional-offline-pcr-prediction).
+The [predictor design](PCR-PREDICTOR-DESIGN.md) details the measurement model,
+the unresolved base-database acquisition/approval process and remaining
+production gates; these observations do not close those gaps.
 
 The build's success marker is emitted only after root finalization, matching
 driver inspection, initramfs inventory checks, ext4 checks, verity generation,

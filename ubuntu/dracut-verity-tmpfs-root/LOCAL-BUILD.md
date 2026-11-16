@@ -266,6 +266,11 @@ The smaller userspace verification/corruption tests in
 
 ### Optional offline PCR prediction
 
+See the [predictor design and open trust inputs](PCR-PREDICTOR-DESIGN.md),
+including the unresolved acquisition and approval of the base Secure Boot `db`.
+The baseline preparation below packages approved bytes; it does not obtain or
+authenticate them.
+
 [predict-pcrs.py](scripts/predict-pcrs.py) runs after the successful build, on
 Linux/WSL with Python 3, OpenSSL and `sbverify` from the existing `sbsigntool`
 build prerequisite. It does not boot a VM, contact Azure/MAA, change firmware

@@ -1,6 +1,6 @@
 # Ubuntu 24.04 CVM: Dracut verity lower + tmpfs upper
 
-[All configurations](../../README.md) | [Validation scope](VALIDATION.md)
+[All configurations](../../README.md) | [Validation scope](VALIDATION.md) | [PCR predictor design and gaps](PCR-PREDICTOR-DESIGN.md)
 
 Run commands from this configuration directory:
 
