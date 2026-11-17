@@ -2,6 +2,7 @@
 """Real userspace component tests. No Marketplace disk, Azure, or VM boot."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -129,6 +130,8 @@ class ComponentTests(unittest.TestCase):
             key, cert = root / "key.pem", root / "cert.pem"
             run("openssl", "req", "-new", "-x509", "-newkey", "rsa:3072", "-nodes",
                 "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", "/CN=Local component test/")
+            signer = root / "signer.der"
+            run("openssl", "x509", "-in", str(cert), "-outform", "DER", "-out", str(signer))
             key.chmod(0o600)
             kernel = root / "vmlinuz"
             kernel.write_bytes(b"synthetic kernel payload: packaging test, not boot evidence\n")
@@ -147,11 +150,23 @@ class ComponentTests(unittest.TestCase):
                     run("sbverify", "--cert", str(cert), str(uki))
                     run("python3", str(RECIPE / "scripts/image_policy.py"), "check-uki",
                         str(uki), str(cmdline), str(kernel), str(initrd))
+                    predicted = json.loads(run(
+                        "python3", str(RECIPE / "scripts/predict-pcrs.py"), "--disable-secure-boot",
+                        "--uki", str(uki), "--signer-der", str(signer), "--phase-path", "sysinit:ready"))
+                    self.assertEqual(set(predicted["pcrs"]), {"4", "11", "12", "13"})
+                    self.assertEqual(predicted["pcr7Policy"], "not-evaluated")
             tampered = root / "tampered.efi"
             tampered.write_bytes(uki.read_bytes().replace(b"ab" * 32, b"cd" * 32, 1))
             result = subprocess.run(["sbverify", "--cert", str(cert), str(tampered)],
                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertNotEqual(result.returncode, 0, result.stdout)
+            result = subprocess.run(
+                ["python3", str(RECIPE / "scripts/predict-pcrs.py"), "--disable-secure-boot",
+                 "--uki", str(tampered), "--signer-der", str(signer), "--phase-path", "sysinit:ready"],
+                text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("sbverify failed", result.stderr)
             cmdline.write_text(cmdline.read_text().replace("ab" * 32, "cd" * 32))
             result = subprocess.run(["python3", str(RECIPE / "scripts/image_policy.py"), "check-uki",
                                      str(uki), str(cmdline), str(kernel), str(initrd)],

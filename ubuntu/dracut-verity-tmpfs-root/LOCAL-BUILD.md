@@ -296,7 +296,8 @@ The smaller userspace verification/corruption tests in
 ### Optional offline PCR prediction
 
 See the [predictor design and open trust inputs](PCR-PREDICTOR-DESIGN.md),
-including the unresolved acquisition and approval of the base Secure Boot `db`.
+including the unresolved acquisition and approval of the base Secure Boot `db`
+for the enabled profile. The disabled profile omits PCR7 and needs no base `db`.
 The baseline preparation below packages approved bytes; it does not obtain or
 authenticate them.
 
@@ -335,7 +336,36 @@ without emitting prediction JSON. Signature verification checks the supplied
 certificate; baseline approval and actual firmware authority selection remain
 the relying party's responsibility.
 
+For a policy that does not rely on firmware signature enforcement, select the
+separate `azure-direct-uki-no-secureboot-v1` profile:
+
+```bash
+python3 scripts/predict-pcrs.py \
+  --disable-secure-boot \
+  --uki /secure/runs/dracut-example/cvm.efi \
+  --signer-der /secure/runs/dracut-example/signer.der \
+  --phase-path 'sysinit:ready' \
+  > /secure/runs/dracut-example/evidence/expected-pcrs.json
+```
+
+This mode rejects firmware-baseline arguments and omits PCR7 from `pcrs` and
+`events`, with `pcr7Policy: not-evaluated`. PCR4/11 and zero-PCR12/13 calculations
+are unchanged. The signed artifact and signer are still checked, but firmware
+enrollment is not required by this image policy. Selecting this mode neither
+disables Secure Boot on a VM nor attests its state.
+
+With Secure Boot off, the stock systemd-stub 255 can replace the embedded
+command line with EFI invocation arguments measured into PCR12. Consequently,
+matching PCR4/11 does not by itself establish the effective verity parameters.
+Require authenticated zero PCR12/13 for the qualified no-external-inputs policy,
+or approve an implementation that disables/constrains those inputs independently
+of Secure Boot. The tested MAA tokens do not authenticate PCR12/13. The disabled
+profile's live measurement sequence and remote verification remain unqualified;
+withhold secrets until fresh hardware-bound evidence is verified.
+
 #### Prepare and approve the firmware baseline
+
+This subsection applies only to the default Secure-Boot-enabled profile.
 
 Obtain complete default variable **values** from an independently trusted
 reference matching your Azure firmware/template revision. Do not use the target
@@ -448,26 +478,25 @@ Required publication and deployment gates:
 4. Deploy one supported **ConfidentialVM** (the acceptance target is
    `Standard_DC4es_v6`, Intel TDX), with Secure Boot and vTPM
    enabled and `VMGuestStateOnly`, following the original custom-key enrollment
-   approach. Do not use Trusted Launch or disable Secure
-   Boot to make a failed UKI boot. Pass your own SSH public key.
+   approach. For an explicitly chosen measured-boot-only deployment, the
+   automatic controller accepts `--disable-secure-boot` / `-DisableSecureBoot`;
+   a manual deployment must likewise explicitly request Secure Boot off and
+   keep vTPM enabled. Do not use Trusted Launch or silently retry without
+   Secure Boot after a failure. Pass your own SSH public key.
 5. Retain Azure `az vm show` evidence of the actual Gallery version and
    `securityProfile`. Confirm capacity/quota before allocating.
 
 Removing the Canonical initramfs also removes its disk-unlock/provisioning
 integration. This reference uses an unencrypted verified OS disk and
 `VMGuestStateOnly` for persisted encrypted firmware/TPM guest state, not
-confidential OS-disk encryption. `NonPersistedTPM` is a separate experimental
-non-persisted guest-state mode; neither option here selects an ephemeral OS
-disk. This reference does **not** support
+confidential OS-disk encryption. OS-disk placement is independent: the automatic
+controller's `--ephemeral-os-disk` selects local NVMe storage on an eligible
+TDX SKU. This reference does **not** support
 `DiskWithVMGuestState`, Canonical's FDE key-unlock flow, or claim compatibility
 with every CVM family. Preserve appropriate image licensing and export policy.
-Stateless custom-key boot is currently blocked: both initial and corrected-image
-`NonPersistedTPM` attempts reported Azure Compute Secure Boot errors despite
-matching Gallery signer readback. An explicit stateless Gallery image profile
-also encountered incompatible definition/UEFI API requirements in the tested
-configuration. See [observed validation limits](VALIDATION.md); do not disable
-Secure Boot or claim that Gallery readback proves the guest firmware trusts the
-key.
+See [observed validation limits](VALIDATION.md); Gallery readback alone does not
+prove that guest firmware trusts the key, and Secure-Boot-disabled boot success
+does not qualify remote image approval.
 
 ## 4. Accept the deployed CVM, including a real reboot
 
@@ -534,6 +563,12 @@ wrapper and provenance to match independent build evidence on both boots.
 Legacy records without SDK evidence explicitly report that the collector was
 not checked; they cannot qualify the updated collector. These local file checks
 are not authenticated remote execution or expected-UKI proof.
+
+For an explicitly Secure-Boot-disabled VM, add `--disable-secure-boot` to
+**both** verifier invocations. It requires firmware SecureBoot `00`, still
+requires SetupMode `00` and vTPM, and reports signer membership without
+requiring it. The JSON records `secureBootEnabled: false`. This is basic
+boot/root acceptance, not signature enforcement or remote attestation.
 It requires at least 128 MiB of measured tmpfs block allocation
 and 2,050 new inodes from 128 MiB plus 2,048 small files and reboot markers.
 Reboot acceptance requires a distinct boot ID and loss of the entire workload.

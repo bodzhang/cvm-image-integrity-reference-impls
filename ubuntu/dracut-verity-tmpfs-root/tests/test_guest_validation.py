@@ -78,6 +78,34 @@ class CollectorTests(unittest.TestCase):
                 target.write_bytes(original)
 
 
+class FirmwareTests(unittest.TestCase):
+    def test_requested_secure_boot_state_is_exact_and_only_enabled_requires_enrollment(self):
+        signer = b"synthetic expected signer" * 20
+        with tempfile.TemporaryDirectory() as directory:
+            efivars = Path(directory)
+            (efivars / f"SetupMode-{guest.GUID}").write_bytes(bytes(5))
+            state = efivars / f"SecureBoot-{guest.GUID}"
+            db = efivars / f"db-{guest.DB_GUID}"
+            for enabled in (True, False):
+                state.write_bytes(bytes(4) + bytes([enabled]))
+                for enrolled in (True, False):
+                    db.write_bytes(bytes(4) + (signer if enrolled else b"other certificate"))
+                    with self.subTest(enabled=enabled, enrolled=enrolled):
+                        if enabled and not enrolled:
+                            with self.assertRaisesRegex(RuntimeError, "not in firmware db"):
+                                guest.verify_firmware(signer, secure_boot=enabled, efivars=efivars)
+                        else:
+                            self.assertIs(guest.verify_firmware(
+                                signer, secure_boot=enabled, efivars=efivars), enrolled)
+                with self.assertRaisesRegex(RuntimeError, "state differs"):
+                    guest.verify_firmware(signer, secure_boot=not enabled, efivars=efivars)
+            db.unlink()
+            self.assertFalse(guest.verify_firmware(signer, secure_boot=False, efivars=efivars))
+            (efivars / f"SetupMode-{guest.GUID}").write_bytes(bytes(4) + b"\x01")
+            with self.assertRaisesRegex(RuntimeError, "Setup Mode"):
+                guest.verify_firmware(signer, secure_boot=False, efivars=efivars)
+
+
 class VerityMountTests(unittest.TestCase):
     def setUp(self):
         self.expected = {

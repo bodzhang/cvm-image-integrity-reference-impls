@@ -16,6 +16,8 @@ param(
     [string] $SubnetPrefix,
     [string] $BuilderImage,
     [ValidateSet('ext4', 'squashfs')][string] $RootFilesystem = 'ext4',
+    [switch] $DisableSecureBoot,
+    [switch] $EphemeralOsDisk,
     [switch] $Plan
 )
 $ErrorActionPreference = 'Stop'
@@ -36,6 +38,8 @@ $arguments = @(
 )
 $arguments += @('--validation-transport', $ValidationTransport)
 $arguments += @('--root-filesystem', $RootFilesystem)
+if ($DisableSecureBoot) { $arguments += '--disable-secure-boot' }
+if ($EphemeralOsDisk) { $arguments += '--ephemeral-os-disk' }
 if ($SshPrivateKey) { $arguments += @('--ssh-private-key', $SshPrivateKey) }
 if ($RunDirectory) { $arguments += @('--run-directory', $RunDirectory) }
 if ($MaaEndpoint) { $arguments += @('--maa-endpoint', $MaaEndpoint) }
