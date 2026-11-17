@@ -237,7 +237,8 @@ describes build-time PCR4/11 calculations. Its [PCR section][azurestack-pcrs]
 masks phase services to stabilize PCR11; this recipe instead retains explicit,
 qualified phase paths. That README does not supply a complete PCR7/12 policy
 or justify omitting external-input checks. Its SquashFS/selective-tmpfs layout
-also differs from this recipe's ext4 lower/whole-root writable overlay, so its
+also differs from this recipe's whole-root writable overlay (ext4 lower by
+default, optionally SquashFS), so its
 runtime-integrity claims cannot be imported unchanged.
 
 [azure-attestation-design]: https://learn.microsoft.com/en-us/azure/confidential-computing/guest-attestation-confidential-virtual-machines-design

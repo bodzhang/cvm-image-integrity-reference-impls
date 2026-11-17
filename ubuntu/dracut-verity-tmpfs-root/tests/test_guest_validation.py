@@ -100,18 +100,28 @@ class VerityMountTests(unittest.TestCase):
             self.assertTrue(kwargs["check"])
             return subprocess.CompletedProcess(args, 0)
 
-        with patch.object(guest, "run", return_value=" ".join(self.table)) as query, \
-                patch.object(guest.subprocess, "run", side_effect=policy) as command:
-            guest.verify_verity_mount(self.expected)
-        query.assert_called_once_with("dmsetup", "table", "root")
-        command.assert_called_once()
+        for filesystem in ("ext4", "squashfs"):
+            with self.subTest(filesystem=filesystem), \
+                    patch.object(guest, "run", side_effect=[filesystem, " ".join(self.table)]) as query, \
+                    patch.object(guest.subprocess, "run", side_effect=policy) as command:
+                guest.verify_verity_mount(dict(self.expected, rootFilesystem=filesystem))
+                self.assertEqual(query.call_count, 2)
+                query.assert_called_with("dmsetup", "table", "root")
+                command.assert_called_once()
+
+    def test_rejects_lower_filesystem_different_from_build_evidence(self):
+        for expected, live in (("ext4", "squashfs"), ("squashfs", "ext4"), ("xfs", "xfs")):
+            with self.subTest(expected=expected, live=live), \
+                    patch.object(guest, "run", return_value=live), \
+                    patch.object(guest.subprocess, "run"), self.assertRaisesRegex(RuntimeError, "filesystem"):
+                guest.verify_verity_mount(dict(self.expected, rootFilesystem=expected))
 
     def test_rejects_wrong_mapper_hash_or_devices_and_failed_mount_policy(self):
         for index, value in ((2, "linear"), (10, "sha512"), (11, "ff" * 32),
                              (4, "8:4"), (5, "8:4")):
             table = self.table.copy()
             table[index] = value
-            with self.subTest(index=index), patch.object(guest, "run", return_value=" ".join(table)), \
+            with self.subTest(index=index), patch.object(guest, "run", side_effect=["ext4", " ".join(table)]), \
                     patch.object(guest.subprocess, "run"), self.assertRaises(RuntimeError):
                 guest.verify_verity_mount(self.expected)
         with patch.object(guest.subprocess, "run", side_effect=subprocess.CalledProcessError(

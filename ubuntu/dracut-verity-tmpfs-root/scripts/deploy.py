@@ -157,6 +157,7 @@ def configuration(args):
         "purpose": PURPOSE, "location": args.location, "vmSize": args.vm_size,
         "builderVmSize": "Standard_D8s_v5", "builderImage": args.builder_image,
         "sourceImage": inputs["imageUrn"], "maximumVms": 2, "adminUsername": "cvmadmin",
+        "rootFilesystem": args.root_filesystem,
         "builderVm": prefix + "-builder", "referenceVm": prefix + "-reference",
         "sourceDisk": prefix + "-source", "network": prefix + "-vnet", "subnet": "cvm",
         "networkSecurityGroup": prefix + "-nsg", "natGateway": prefix + "-nat",
@@ -767,7 +768,7 @@ class Engine:
             "-C /opt/cvm-dracut/checkout/ubuntu/dracut-verity-tmpfs-root\n"
             "cat > /var/lib/cvm-dracut/builder.sh <<'CVM_BUILDER_SCRIPT'\n"
             + (RECIPE / "scripts/deployment-builder.sh").read_text() + "\nCVM_BUILDER_SCRIPT\n"
-            "bash /var/lib/cvm-dracut/builder.sh provision\n")
+            "bash /var/lib/cvm-dracut/builder.sh provision " + shlex.quote(self.c["rootFilesystem"]) + "\n")
         self.managed("provision", stage, "DRACUT_BUILDER_PROVISIONED", timeout=3600)
         if self.c.get("validationTransport", "ssh") == "ssh":
             self.bootstrap("builder", "first")
@@ -783,7 +784,8 @@ class Engine:
             "lun": 0, "name": self.c["sourceDisk"], "createOption": "Attach", "managedDisk": {"id": disk["id"]},
             "caching": "ReadOnly", "deleteOption": "Detach",
         }]}}})
-        self.managed("build", "bash /var/lib/cvm-dracut/builder.sh build\n",
+        self.managed("build", "bash /var/lib/cvm-dracut/builder.sh build "
+                     + shlex.quote(self.c["rootFilesystem"]) + "\n",
                      "DRACUT_DEPLOYMENT_BUILD_PASSED", timeout=14400)
         root = "/var/lib/cvm-dracut"
         for remote, local in (
@@ -801,6 +803,8 @@ class Engine:
         return build, provenance, profile
 
     def validate_build(self, build, provenance, manifest):
+        require(build.get("rootFilesystem", "ext4") == self.c.get("rootFilesystem", "ext4")
+                == provenance.get("rootFilesystem", "ext4"), "Build root filesystem differs from requested policy")
         require(provenance.get("result") == "DRACUT_DEPLOYMENT_BUILD_PASSED"
                 and provenance.get("recipeFiles") == manifest, "Final builder provenance/recipe manifest mismatch")
         require(provenance.get("sourceMatchesOriginal") is True
@@ -1218,6 +1222,8 @@ def parser():
     deploy.add_argument("--network-address-prefix", default="10.73.0.0/24")
     deploy.add_argument("--subnet-prefix", default="10.73.0.0/26")
     deploy.add_argument("--builder-image", default=BUILDER_IMAGE, help="Pinned standard Ubuntu 24.04 server URN")
+    deploy.add_argument("--root-filesystem", choices=("ext4", "squashfs"), default="ext4",
+                        help="Verified lower filesystem; both retain the whole-root tmpfs overlay")
     deploy.add_argument("--plan", action="store_true")
     cleanup = subs.add_parser("cleanup")
     cleanup.add_argument("--run-directory", required=True)

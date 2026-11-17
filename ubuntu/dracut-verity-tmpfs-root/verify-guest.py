@@ -65,6 +65,10 @@ def verify_attestation_collector(expected, root=Path("/")):
 
 def verify_verity_mount(expected):
     subprocess.run(["/usr/local/libexec/cvm-check-root", "/"], check=True, stdout=sys.stderr)
+    filesystem = expected.get("rootFilesystem", "ext4")
+    require(filesystem in ("ext4", "squashfs"), "Unsupported root filesystem in build evidence")
+    require(run("findmnt", "-rn", "-S", "/dev/mapper/root", "-o", "FSTYPE") == filesystem,
+            "Live lower filesystem differs from build evidence")
     table = run("dmsetup", "table", "root").split()
     require(len(table) >= 13 and table[2:4] == ["verity", "1"], "Unexpected verity table")
     require(table[10] == "sha256" and table[11] == expected["rootHash"], "Live root hash differs from the UKI")
@@ -102,6 +106,7 @@ def main():
         "systemd.verity_root_data=/dev/disk/by-partuuid/" + expected["dataPartUuid"],
         "systemd.verity_root_hash=/dev/disk/by-partuuid/" + expected["hashPartUuid"],
         "root=/dev/mapper/root", "systemd.volatile=overlay",
+        "rootfstype=" + expected.get("rootFilesystem", "ext4"),
     ):
         require(cmdline.count(parameter) == 1, f"Missing or duplicate expected boot parameter: {parameter}")
     verify_verity_mount(expected)

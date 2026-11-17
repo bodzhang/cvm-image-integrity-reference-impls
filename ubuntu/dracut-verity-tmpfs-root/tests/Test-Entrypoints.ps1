@@ -16,6 +16,7 @@ $parameters = @{
     NetworkAddressPrefix = '10.80.0.0/24'
     SubnetPrefix = '10.80.0.0/26'
     Plan = $true
+    RootFilesystem = 'squashfs'
 }
 $config = (& (Join-Path $recipe 'Deploy.ps1') @parameters) | ConvertFrom-Json
 if ($config.resourceGroup -ne $parameters.ResourceGroup -or $config.prefix -ne $parameters.Prefix) {
@@ -23,6 +24,9 @@ if ($config.resourceGroup -ne $parameters.ResourceGroup -or $config.prefix -ne $
 }
 if ($config.sourceImage -ne 'Canonical:ubuntu-24_04-lts:cvm:24.04.202610280') {
     throw 'PowerShell deployment did not select the Dracut image pin.'
+}
+if ($config.rootFilesystem -ne 'squashfs') {
+    throw 'PowerShell deployment did not forward the lower filesystem selection.'
 }
 if ($config.sshSourceCidr -ne $parameters.SshSourceCidr -or
     $config.networkAddressPrefix -ne $parameters.NetworkAddressPrefix -or

@@ -7,7 +7,8 @@ initramfs/manifest flow with **Dracut and systemd**. It starts from an unbooted
 Azure Ubuntu CVM Marketplace disk, finalizes a disposable root filesystem,
 generates dm-verity data, and builds a signed UKI embedding `roothash=` and
 explicit data/hash partition identifiers. All writes to the effective root are
-volatile; the verified ext4 lower never has a writable fallback.
+volatile; the verified lower (ext4 by default, optionally SquashFS) never has a
+writable fallback. Both modes retain the whole-root tmpfs overlay.
 
 **Status: experimental. Complete Marketplace conversion, custom-signed UKI
 boot and first-boot/real-reboot acceptance passed on an Azure Intel TDX CVM
@@ -19,6 +20,8 @@ rebuilt with the native collector, passed publication, first/reboot SSH
 acceptance and installed-collector custom-policy MAA testing on 2026-11-13.
 Older Gallery 1.0.3 still contains the firmware-only collector.**
 See [the observed evidence and limits](VALIDATION.md).
+These Azure results used ext4. SquashFS is a new optional mode, not yet
+qualified by an Azure first-boot/reboot run.
 Do not claim production integrity or remote image verification from these tests.
 
 ## Inputs and boundaries
@@ -60,20 +63,21 @@ Azure are manual, optional, billable operations in your own authorized scope.
 Unbooted Marketplace raw disk (read-only)
   -> new GPT disk; copy root and optional separate /boot
   -> offline customization + guest packages + matching-kernel Dracut initramfs
-  -> unmount root, check ext4, veritysetup format
+  -> finalize ext4 or pack gzip SquashFS; unmount staging root
+  -> check lower filesystem, veritysetup format over the full data partition
   -> ukify with original kernel, new initramfs, generated signed .cmdline
   -> write signed UKI to ESP only, check GPT and fixed-VHD format
   -> fixed Azure VHD
 
 Firmware Secure Boot db -> signed EFI/BOOT/BOOTX64.EFI (systemd-stub UKI)
   -> systemd-veritysetup-generator -> read-only /dev/mapper/root
-  -> /sysroot ext4 ro,noload -> systemd.volatile=overlay (tmpfs upper/work)
+  -> /sysroot read-only ext4 or SquashFS -> whole-root overlay (tmpfs upper/work)
   -> required initramfs root-policy guard -> switch-root -> writable volatile /
 ```
 
-The new disk has a 512 MiB ESP, 32 GiB ext4 data partition, and a separately
+The new disk has a 512 MiB ESP, 32 GiB data partition, and a separately
 sized SHA-256 verity hash partition. Data/hash PARTUUIDs are generated per build.
-The signed command line contains:
+The default ext4 signed command line contains:
 
 ```text
 root=/dev/mapper/root rootfstype=ext4 ro rootflags=ro,noload
@@ -84,9 +88,13 @@ systemd.verity_root_options=panic-on-corruption
 systemd.volatile=overlay
 ```
 
+SquashFS instead embeds `rootfstype=squashfs rootflags=ro`; it does not use ext4's
+`noload` option. All verity bindings, corruption handling and whole-root overlay
+settings are unchanged.
+
 Root-device auto-discovery and initrd fstab processing are disabled. A required
 unit blocks `initrd-switch-root.service` unless the effective root is a writable
-overlay with upper/work on the same tmpfs, an ext4 read-only lower is mounted
+overlay with upper/work on the same tmpfs, a supported read-only lower is mounted
 from the healthy verity mapper, and no swap is active. Corruption must not be
 ignored. A second guard checks the effective root during normal system startup.
 The Dracut module overrides `systemd-volatile-root.service` with a fail-closed
@@ -96,6 +104,8 @@ retains a tmpfs at `/run/cvm-overlay`, and mounts the overlay using visible
 upper/work directories there. This avoids native systemd's covered root mount
 and detached tmpfs backing, so both initramfs and runtime guards can verify the
 actual backing filesystems rather than trusting setup metadata.
+Guest acceptance additionally checks that the live lower type matches the
+independently retained build's `rootFilesystem` (ext4 or SquashFS).
 There is no GRUB, shim, unsigned command-line add-on, Canonical manifest or
 stock-initramfs fallback on the new ESP. Firmware must support the standard
 Gen2 removable-media path; it was accepted in the tested persisted-TPM configuration.
@@ -166,6 +176,8 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   build-essential git python3 binutils openssl sbsigntool systemd-ukify qemu-utils \
   rsync gdisk dosfstools e2fsprogs cryptsetup-bin util-linux udev kmod
+# Also required when choosing the optional SquashFS lower:
+sudo apt-get install -y --no-install-recommends squashfs-tools
 ```
 
 The builder also needs an approved Rust toolchain (SDK minimum Rust 1.90;
@@ -198,6 +210,14 @@ reproducibility and arbitrary future package versions are not claimed.
 
 Budget at least 150 GiB plus package headroom. The 32 GiB data partition is
 fixed for this configuration; a source that does not fit fails during copy.
+SquashFS mode first finalizes the root in a separate sparse 32 GiB ext4 staging
+file, then packs it with gzip after all pseudo-filesystems have been unmounted.
+Allow additional space for the uncompressed staging files and compressed image.
+Packing preserves ownership, permissions, hardlinks and extended attributes.
+The build requires `CONFIG_SQUASHFS_ZLIB=y` and the matching signed/built-in
+source SquashFS driver and dependencies; missing support aborts the build.
+The compressed image must fit the data partition. Its trailing zero padding is
+also hashed; neither the fixed partition nor fixed VHD gets smaller.
 Optional corruption qualification makes a disposable data-partition copy. Reserve ample
 tmpfs RAM in the eventual CVM; do not add disk swap to compensate.
 
@@ -217,6 +237,14 @@ sudo unshare --mount --propagation private bash build-image.sh /secure/input/sou
   /secure/runs/dracut-example '<exact-source-kernel-version>'
 ```
 
+To select SquashFS, append the sixth positional argument:
+
+```bash
+sudo unshare --mount --propagation private bash build-image.sh /secure/input/source.raw \
+  /secure/signer/db.key /secure/signer/db.pem \
+  /secure/runs/dracut-squashfs '<exact-source-kernel-version>' squashfs
+```
+
 The key stays outside the guest and output image. Existing run directories,
 in-checkout signing inputs/output directories, provisioned sources and
 mismatched/expired certificates are rejected. The source image is opened
@@ -226,9 +254,10 @@ Success requires `DRACUT_VERITY_IMAGE_BUILD_PASSED` and produces:
 
 - `image.raw`, Azure fixed `image.vhd`, `cvm.efi` and public `signer.der`;
 - original kernel payload, new initramfs and exact generated `cmdline`;
-- `evidence/build.json` with kernel, root hash and both PARTUUIDs;
+- `evidence/build.json` with kernel, root hash, both PARTUUIDs and `rootFilesystem`;
 - source/output hashes, source/output GPT layout, package and signed-driver
-  inventories, initrd inventory, verity format, ext4 and fixed-VHD checks.
+  inventories, initrd inventory, verity format, filesystem and fixed-VHD checks
+  (`fsck.txt` for ext4; `squashfs.txt` for SquashFS).
 
 The signed UKI's `.linux`, `.initrd` and `.cmdline` are checked byte-for-byte
 against inputs; `sbverify` checks the certificate signature. The protected root
@@ -836,14 +865,17 @@ python3 tests/test_pcr_prediction.py
 python3 tests/test_guest_validation.py
 # On a disposable Ubuntu 24.04 test machine:
 sudo apt-get install -y --no-install-recommends \
-  dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool
+  dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool squashfs-tools
 sudo python3 tests/test_components.py
 ```
 
 The component test creates a real **kernel-less** Dracut/systemd initramfs,
 packages a synthetic kernel payload in a real signed UKI, checks all sections
 and rejects a changed expected command line. It also formats/verifies actual
-verity files and rejects corruption. It does not boot a synthetic or real CVM.
+verity files and rejects corruption. The SquashFS component test runs the
+production packing/copy path, checks extracted metadata and verifies that
+dm-verity rejects corruption in the padded data partition. It does not boot a
+synthetic or real CVM or qualify the pinned kernel's SquashFS driver.
 Missing component-test tools are failures, not skipped checks. CI runs this configuration
 separately on Ubuntu 24.04 without Azure resource creation.
 The predictor tests also compare PCR11 with systemd-measure when available

@@ -15,6 +15,7 @@ param(
     [string] $NetworkAddressPrefix,
     [string] $SubnetPrefix,
     [string] $BuilderImage,
+    [ValidateSet('ext4', 'squashfs')][string] $RootFilesystem = 'ext4',
     [switch] $Plan
 )
 $ErrorActionPreference = 'Stop'
@@ -34,6 +35,7 @@ $arguments = @(
     '--ssh-public-key', $SshPublicKey, '--location', $Location, '--vm-size', $VmSize
 )
 $arguments += @('--validation-transport', $ValidationTransport)
+$arguments += @('--root-filesystem', $RootFilesystem)
 if ($SshPrivateKey) { $arguments += @('--ssh-private-key', $SshPrivateKey) }
 if ($RunDirectory) { $arguments += @('--run-directory', $RunDirectory) }
 if ($MaaEndpoint) { $arguments += @('--maa-endpoint', $MaaEndpoint) }

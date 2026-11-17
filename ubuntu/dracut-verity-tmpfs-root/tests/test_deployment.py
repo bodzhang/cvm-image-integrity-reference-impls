@@ -139,6 +139,16 @@ class PlanningTests(Fixture):
         with self.assertRaisesRegex(deploy.DeploymentError, "outside"):
             deploy.configuration(deploy.parser().parse_args(self.arguments + ["--plan"]))
 
+    def test_squashfs_selection_is_explicit_and_plan_preserves_it(self):
+        args = self.arguments[:]
+        args[args.index("--run-directory") + 1] = str(self.workspace / "squashfs-plan")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(deploy.main(args + ["--root-filesystem", "squashfs", "--plan"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["rootFilesystem"], "squashfs")
+        self.assertEqual(self.config["rootFilesystem"], "ext4")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            deploy.parser().parse_args(args + ["--root-filesystem", "xfs"])
+
     def test_rejects_public_ssh_wrong_tee_unpinned_builder_and_bad_endpoint(self):
         for option, value in (
             ("--ssh-source-cidr", "0.0.0.0/0"), ("--ssh-source-cidr", "8.8.8.8/32"),
@@ -911,6 +921,30 @@ class EvidenceTests(Fixture):
             "buildJsonSha256": deploy.digest((self.engine.evidence / "build.json").read_bytes()),
         }
         self.engine.validate_build(build, provenance, manifest)
+        for filesystem in ("ext4", "squashfs"):
+            with self.subTest(filesystem=filesystem):
+                self.config["rootFilesystem"] = filesystem
+                selected_build = dict(build, rootFilesystem=filesystem)
+                selected_provenance = dict(provenance, rootFilesystem=filesystem)
+                deploy.write_json(self.engine.evidence / "build.json", selected_build, exclusive=False)
+                selected_provenance["buildJsonSha256"] = deploy.digest(
+                    (self.engine.evidence / "build.json").read_bytes())
+                self.engine.validate_build(selected_build, selected_provenance, manifest)
+                other = "ext4" if filesystem == "squashfs" else "squashfs"
+                for mismatch in (other, "xfs"):
+                    with self.assertRaisesRegex(deploy.DeploymentError, "root filesystem"):
+                        self.engine.validate_build(dict(selected_build, rootFilesystem=mismatch),
+                                                   selected_provenance, manifest)
+                    with self.assertRaisesRegex(deploy.DeploymentError, "root filesystem"):
+                        self.engine.validate_build(selected_build, dict(selected_provenance, rootFilesystem=mismatch),
+                                                   manifest)
+                if filesystem == "squashfs":
+                    with self.assertRaisesRegex(deploy.DeploymentError, "root filesystem"):
+                        self.engine.validate_build(build, selected_provenance, manifest)
+                    with self.assertRaisesRegex(deploy.DeploymentError, "root filesystem"):
+                        self.engine.validate_build(selected_build, provenance, manifest)
+        self.config["rootFilesystem"] = "ext4"
+        deploy.write_json(self.engine.evidence / "build.json", build, exclusive=False)
         for change in (
             {"sourceMatchesOriginal": False}, {"sourceRawSha256": "ff" * 32}, {"kernel": "builder-host-kernel"},
             {"recipeFiles": {}}, {"outputs": dict(provenance["outputs"], **{"signer.der": "ff" * 32})},
@@ -921,6 +955,24 @@ class EvidenceTests(Fixture):
         changed_build["attestationSdk"]["revision"] = "unapproved"
         with self.assertRaises(deploy.DeploymentError):
             self.engine.validate_build(changed_build, provenance, manifest)
+
+    def test_build_forwards_selected_filesystem_to_provision_and_build(self):
+        class StopBeforeRemoteBuild(Exception):
+            pass
+
+        for filesystem in ("ext4", "squashfs"):
+            self.config["rootFilesystem"] = filesystem
+            with self.subTest(filesystem=filesystem), \
+                    patch.object(deploy, "recipe_archive", return_value=(b"unit archive", {})), \
+                    patch.object(self.engine, "managed", side_effect=[None, StopBeforeRemoteBuild]) as managed, \
+                    patch.object(self.engine, "az", return_value={"id": "unit-source"}), \
+                    patch.object(self.engine, "owned"), patch.object(self.engine, "bootstrap"), \
+                    patch.object(self.engine, "vm", return_value={"id": "unit-builder"}), \
+                    patch.object(self.engine, "rest"), self.assertRaises(StopBeforeRemoteBuild):
+                self.engine.build()
+            provision, build = managed.call_args_list
+            self.assertTrue(provision.args[1].endswith(f"builder.sh provision {filesystem}\n"))
+            self.assertEqual(build.args[1], f"bash /var/lib/cvm-dracut/builder.sh build {filesystem}\n")
 
 
 class UploadTests(Fixture):

@@ -15,8 +15,9 @@ resources or signing keys is required.
 
 This independent recipe uses **Dracut/systemd**, not Canonical snap-bootstrap.
 The signed UKI embeds the root hash and both verity partition identifiers.
-The effective root is a writable overlay backed by tmpfs over a read-only
-dm-verity lower; it has no writable disk fallback.
+The effective root is a whole-root writable overlay backed by tmpfs over a
+read-only dm-verity lower: **ext4 by default, optionally gzip-compressed
+SquashFS**. Neither mode has a writable disk fallback.
 
 ### Related reference
 
@@ -24,8 +25,8 @@ See Azure's [AzureStack-Tools Confidential Computing CVM Image Builder](https://
 for another Dracut/systemd, UKI and dm-verity implementation. This recipe is not
 a direct port: that builder creates Ubuntu with `debootstrap`, uses SquashFS and
 limits writable state to selected directories; this recipe preserves the pinned
-Marketplace kernel/modules and uses an ext4 verity lower with a whole-root tmpfs
-overlay.
+Marketplace kernel/modules and retains a whole-root tmpfs overlay with either
+an ext4 or SquashFS verity lower.
 
 **Experimental:** manual Gallery 1.0.4 publication, Intel TDX first/reboot SSH
 acceptance and installed native-collector MAA testing passed. The shared controller
@@ -33,6 +34,8 @@ built/uploaded a fresh image and completed Gallery replication; recovered manage
 first/reboot acceptance and cleanup also passed. An uninterrupted one-command
 deployment has not yet been demonstrated. PCR12/13 token coverage, stateless boot and production-complete
 expected-image remote verification remain unqualified.
+Those Azure results used ext4; the optional SquashFS mode still requires its own
+Azure first-boot/reboot qualification.
 
 ## Supported baseline
 
@@ -106,6 +109,27 @@ build. The unbooted source is a disk, not a third VM.
 
 The manual workflow remains available through [build-image.sh](build-image.sh).
 Never run image mounts/builds on a shared or production host.
+
+### Choose the verified lower filesystem
+
+The default is `ext4`. Select SquashFS with `--root-filesystem squashfs` on
+`deploy.sh`, or `-RootFilesystem squashfs` on `Deploy.ps1`; add the same option
+to a `--plan` / `-Plan` invocation to preview it. For manual builds, append
+`squashfs` after the source-kernel argument to `build-image.sh`.
+
+Both modes keep **all of `/` writable through the tmpfs upper**, including
+legacy software and agent state; writes disappear at reboot. SquashFS does not
+switch to a selectively writable root or add runtime code-integrity enforcement.
+The build requires the source kernel's SquashFS driver and gzip support and
+includes the matching source driver dependencies in the initramfs. The selected
+filesystem is embedded in the signed command line and checked against build
+evidence during guest acceptance. Regenerate expected PCR4/11 from the resulting
+UKI; do not reuse another build or filesystem mode's image approval.
+
+SquashFS compresses lower-filesystem content, but this option does **not** shrink
+the fixed 32 GiB data partition or Azure fixed VHD. The full data partition,
+including padding, remains protected by dm-verity. Building it also needs an
+uncompressed staging filesystem and a temporary compressed image.
 
 ## Prerequisites for automatic deployment
 

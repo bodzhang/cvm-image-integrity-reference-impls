@@ -2,6 +2,18 @@
 
 [Recipe](README.md) | [Manual workflow](LOCAL-BUILD.md) | [Repository index](../../README.md)
 
+## Optional SquashFS lower
+
+The Azure image-build, Gallery and first-boot/reboot results below used the
+default ext4 lower. The optional SquashFS mode retains the same whole-root tmpfs
+overlay; it does not inherit Azure boot qualification from those ext4 runs.
+Local tests exercise filesystem selection, signed UKI command lines, fail-closed
+root guards, deployment forwarding and build/guest filesystem-policy matching.
+A real userspace test runs the build's gzip SquashFS packing/copy path, checks
+file metadata and rejects both partition overflow and dm-verity corruption in
+the padded data partition. These tests do not establish matching source-kernel
+driver support or a successful SquashFS CVM first boot/reboot.
+
 ## Deployment entry-point qualification
 
 The Bash and PowerShell entry points share a Python deployment/cleanup engine.
